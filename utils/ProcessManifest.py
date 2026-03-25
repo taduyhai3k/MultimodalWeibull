@@ -5,6 +5,17 @@ import ContourCheck
 import UploadDriver
 import pandas as pd
 import os
+import argparse
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--manifest", help="Path to the manifest file")
+parser.add_argument("--model", help="Name of the model to use")
+parser.add_argument("--patch_size", type=int, help="Size of the patches")
+parser.add_argument("--final_size", type=int, help="Final size of the features")
+parser.add_argument("--batch_size", type=int, help="Batch size for processing")
+parser.add_argument("--driver_folder", help="Folder to upload features to")
+
+args = parser.parse_args()
 
 def get_case_id(filename):
     """
@@ -42,4 +53,13 @@ def process_manifestes(list_of_manifest_paths:list, model_name:str, patch_size:i
     for manifest_path in list_of_manifest_paths:
         print(f"--- Processing manifest: {manifest_path} ---")
         process_manifest(manifest_path, extractor, patch_size, final_size, batch_size, driver_folder + "/" + os.path.basename(manifest_path).split('.')[0])
+if __name__ == "__main__":
+    process_manifestes(
+        list_of_manifest_paths=[args.manifest],
+        model_name=args.model,
+        patch_size=args.patch_size,
+        final_size=args.final_size,
+        batch_size=args.batch_size,
+        driver_folder=args.driver_folder
+    )
     

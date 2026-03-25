@@ -3,6 +3,8 @@ import timm
 from torchvision import transforms
 
 
+
+
 class FeatureExtractor:
     """Class dùng Swin Transformer để trích xuất đặc trưng"""
     def __init__(self, model_name='swin_tiny_patch4_window7_224'):
