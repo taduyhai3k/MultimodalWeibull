@@ -1,0 +1,44 @@
+{
+  "files": [
+    {
+      "name": "blca-003.zip",
+      "url": "https://drive.google.com/file/d/1LXKdE1WA0XcgIYW2OvnW4ubRi4eNtxtd/view?usp=drive_link",
+      "kind": "wsi",
+      "cohort": "blca",
+      "destination": "WSIs/blca-003",
+      "sha256": ""
+    },
+    {
+      "name": "brca-004.zip",
+      "url": "https://drive.google.com/file/d/1oh5y5jSNYpif0oPFJSVLYpUW9I4BlC_x/view?usp=drive_link",
+      "kind": "wsi",
+      "cohort": "brca",
+      "destination": "WSIs/brca-004",
+      "sha256": ""
+    },
+    {
+      "name": "coadread-005.zip",
+      "url": "https://drive.google.com/file/d/1oqGLCI2f-avVLq63YmHU0wgK46y8mKSN/view?usp=drive_link",
+      "kind": "wsi",
+      "cohort": "coadread",
+      "destination": "WSIs/coadread-005",
+      "sha256": ""
+    },
+    {
+      "name": "hnsc-001.zip",
+      "url": "https://drive.google.com/file/d/1nBS0eMual5K5RRFJKoWOXH8BJNwkGJqH/view?usp=drive_link",
+      "kind": "wsi",
+      "cohort": "hnsc",
+      "destination": "WSIs/hnsc-001",
+      "sha256": ""
+    },
+    {
+      "name": "stad-002.zip",
+      "url": "https://drive.google.com/file/d/1H042uwT9Hd-S6fYoVdaoyxGPIwTyqIcx/view?usp=drive_link",
+      "kind": "wsi",
+      "cohort": "stad",
+      "destination": "WSIs/stad-002",
+      "sha256": ""
+    }
+  ]
+}

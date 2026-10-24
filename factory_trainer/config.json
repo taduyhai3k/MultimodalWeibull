@@ -1,0 +1,105 @@
+{
+  "output": "runs/factory_v1",
+  "folds": [
+    0,
+    1,
+    2,
+    3,
+    4
+  ],
+  "factory_class": "dataset.DatasetFactory:SurvivalDatasetFactory",
+  "model_class": "model:MultiModelWeibull",
+  "criterion_class": "block.loss:PIBDWeibullLoss",
+  "evaluate_test": true,
+  "factory_kwargs": {
+    "omic_format": "pathways",
+    "n_bins": 4,
+    "label_col": "survival_months_dss",
+    "num_patches": 4096,
+    "mode": "shuffle",
+    "print_info": false
+  },
+  "model_kwargs": {
+    "input_dim": 768,
+    "hidden_dim": 128,
+    "num_proxies": 8,
+    "top_k": 256,
+    "sample_num": 30,
+    "num_member": 3
+  },
+  "criterion_kwargs": {
+    "hidden_dim": 128
+  },
+  "training": {
+    "epochs": 100,
+    "patience": 15,
+    "lr": 0.0001,
+    "club_lr": 0.0001,
+    "weight_decay": 0.0001,
+    "batch_size": 4,
+    "eval_batch_size": 4,
+    "workers": 0,
+    "seed": 42,
+    "clip": 5.0,
+    "plot_every": 5,
+    "plot_cases": 3,
+    "train_eval_every": 1,
+    "val_auxiliary": true,
+    "poe_names": [
+      "histology",
+      "pathway"
+    ]
+  },
+  "cohorts": {
+    "blca": {
+      "split_template": "5foldcv/tcga_blca/splits_{fold}.csv",
+      "factory_kwargs": {
+        "label_file": "datasets_csv/metadata/tcga_blca.csv",
+        "omics_file": "datasets_csv/raw_rna_data/combine/blca/rna_clean.csv",
+        "clinical_file": "datasets_csv/clinical_data/tcga_blca_clinical.csv",
+        "signature_file": "datasets_csv/metadata/combine_signatures.csv",
+        "wsi_dir": "WSIs/blca-003/blca/tiles-l1-s224/feats-l1-s224-CTransPath-sampler"
+      }
+    },
+    "brca": {
+      "split_template": "5foldcv/tcga_brca/splits_{fold}.csv",
+      "factory_kwargs": {
+        "label_file": "datasets_csv/metadata/tcga_brca.csv",
+        "omics_file": "datasets_csv/raw_rna_data/combine/brca/rna_clean.csv",
+        "clinical_file": "datasets_csv/clinical_data/tcga_brca_clinical.csv",
+        "signature_file": "datasets_csv/metadata/combine_signatures.csv",
+        "wsi_dir": "WSIs/brca-004/brca/tiles-l1-s224/feats-l1-s224-CTransPath-sampler"
+      }
+    },
+    "coadread": {
+      "split_template": "5foldcv/tcga_coadread/splits_{fold}.csv",
+      "factory_kwargs": {
+        "label_file": "datasets_csv/metadata/tcga_coadread.csv",
+        "omics_file": "datasets_csv/raw_rna_data/combine/coadread/rna_clean.csv",
+        "clinical_file": "datasets_csv/clinical_data/tcga_coadread_clinical.csv",
+        "signature_file": "datasets_csv/metadata/combine_signatures.csv",
+        "wsi_dir": "WSIs/coadread-005/coadread/tiles-l1-s224/feats-l1-s224-CTransPath-sampler"
+      }
+    },
+    "hnsc": {
+      "split_template": "5foldcv/tcga_hnsc/splits_{fold}.csv",
+      "factory_kwargs": {
+        "label_file": "datasets_csv/metadata/tcga_hnsc.csv",
+        "omics_file": "datasets_csv/raw_rna_data/combine/hnsc/rna_clean.csv",
+        "clinical_file": "datasets_csv/clinical_data/tcga_hnsc_clinical.csv",
+        "signature_file": "datasets_csv/metadata/combine_signatures.csv",
+        "wsi_dir": "WSIs/hnsc-001/hnsc/tiles-l1-s224/feats-l1-s224-CTransPath-sampler"
+      }
+    },
+    "stad": {
+      "split_template": "5foldcv/tcga_stad/splits_{fold}.csv",
+      "factory_kwargs": {
+        "label_file": "datasets_csv/metadata/tcga_stad.csv",
+        "omics_file": "datasets_csv/raw_rna_data/combine/stad/rna_clean.csv",
+        "clinical_file": "datasets_csv/clinical_data/tcga_stad_clinical.csv",
+        "signature_file": "datasets_csv/metadata/combine_signatures.csv",
+        "wsi_dir": "WSIs/stad-002/stad/tiles-l1-s224/feats-l1-s224-CTransPath-sampler"
+      }
+    }
+  }
+}
