@@ -38,7 +38,7 @@ class ModalEncoder(nn.Module):
         for block in self.encoder:
             histfeatures = block(histfeatures)
         mu_proxies, sigma_proxies = self.proxies()
-        noise = self.gaussian_noise_train()
+        noise = self.gaussian_noise_train().to(device= mu_proxies.device, dtype=mu_proxies.dtype)
         sampled_proxies = mu_proxies.unsqueeze(1) + sigma_proxies.unsqueeze(1) * noise
         mean_proxies = nn.functional.normalize(torch.mean(sampled_proxies, dim=1), dim=-1).unsqueeze(0)
         histfeatures = nn.functional.normalize(histfeatures, dim=-1)
@@ -87,8 +87,23 @@ class ModalEncoder(nn.Module):
         similarity_topk_negative, index_n = torch.topk(similarity_negative, self.top_k, dim = 1)
         mask_positive = torch.gather(input=valid_patch_mask, dim=1, index=index_p)
         mask_negative = torch.gather(input=valid_patch_mask.unsqueeze(-1).expand(-1, -1, similarity_topk_negative.size(-1)), dim=1, index=index_n)
-        similarity_positive_mean = torch.mean(similarity_topk_positive * mask_positive, dim=1)
-        similarity_negative_mean = torch.mean(similarity_topk_negative * mask_negative, dim=(1,2))
+        positive = similarity_topk_positive.masked_fill(
+            ~mask_positive, 0.0
+        )
+        negative = similarity_topk_negative.masked_fill(
+            ~mask_negative, 0.0
+        )
+
+        similarity_positive_mean = (
+            positive.sum(dim=1)
+            / mask_positive.sum(dim=1).clamp_min(1)
+        )
+        similarity_negative_mean = (
+            negative.sum(dim=(1, 2))
+            / mask_negative.sum(dim=(1, 2)).clamp_min(1)
+        )
+        #similarity_positive_mean = torch.mean(similarity_topk_positive * mask_positive, dim=1)
+        #similarity_negative_mean = torch.mean(similarity_topk_negative * mask_negative, dim=(1,2))
         mu_true = mu_proxies[proxies_indice]
         sigma_true = sigma_proxies[proxies_indice]
         similarity_unbind = similarity.view(similarity.size(0), -1)
@@ -104,7 +119,7 @@ class ModalEncoder(nn.Module):
         for block in self.encoder:
             histfeatures = block(histfeatures)
         mu_proxies, sigma_proxies = self.proxies()
-        noise = self.gaussian_noise_inference()
+        noise = self.gaussian_noise_inference().to(device=mu_proxies.device, dtype=mu_proxies.dtype)
         sampled_proxies = mu_proxies.unsqueeze(1) + sigma_proxies.unsqueeze(1) * noise
         mean_proxies = nn.functional.normalize(torch.mean(sampled_proxies, dim=1), dim=-1).unsqueeze(0)
         histfeatures = nn.functional.normalize(histfeatures, dim=-1)

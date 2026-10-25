@@ -383,10 +383,11 @@ class PIBDWeibullLoss(nn.Module):
     Coefficients are configurable starting values, not official PIBD settings.
     MI estimators must be fitted separately using club_learning_loss().
     """
-    def __init__(self, hidden_dim=128, proxy_weight=1.0, kl_weight=1e-3,
-                 alignment_weight=1.0, mi_weight=1e-3):
+    def __init__(self, hidden_dim=128,survival_weight=2.0,proxy_weight=1.0, kl_weight=1e-2,
+                 alignment_weight=1.0, mi_weight=1):
         super().__init__()
         self.weibull = WeibullLossandInference()
+        self.survival_weight = survival_weight
         self.proxy_weight = proxy_weight
         self.kl_weight = kl_weight
         self.alignment_weight = alignment_weight
@@ -441,7 +442,7 @@ class PIBDWeibullLoss(nn.Module):
         finally:
             for v, state in zip(params, states):
                 v.requires_grad_(state)
-        total = (survival + self.proxy_weight*proxy + self.kl_weight*kl
+        total = (self.survival_weight * survival + self.proxy_weight*proxy + self.kl_weight*kl
                  + self.alignment_weight*alignment + self.mi_weight*mi)
         return dict(total=total, survival=survival, proxy=proxy, kl=kl,
                     alignment=alignment, mi=mi)

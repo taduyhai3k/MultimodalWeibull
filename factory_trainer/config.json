@@ -28,16 +28,21 @@
     "num_member": 3
   },
   "criterion_kwargs": {
-    "hidden_dim": 128
+    "hidden_dim": 128,
+    "survival_weight": 2.0,
+    "proxy_weight": 1.0,
+    "kl_weight": 1e-2,
+    "alignment_weight": 1.0,
+    "mi_weight": 1
   },
   "training": {
     "epochs": 100,
-    "patience": 15,
+    "patience": 50,
     "lr": 0.0001,
     "club_lr": 0.0001,
     "weight_decay": 0.0001,
-    "batch_size": 4,
-    "eval_batch_size": 4,
+    "batch_size": 64,
+    "eval_batch_size": 64,
     "workers": 0,
     "seed": 42,
     "clip": 5.0,
@@ -58,7 +63,7 @@
         "omics_file": "datasets_csv/raw_rna_data/combine/blca/rna_clean.csv",
         "clinical_file": "datasets_csv/clinical_data/tcga_blca_clinical.csv",
         "signature_file": "datasets_csv/metadata/combine_signatures.csv",
-        "wsi_dir": "WSIs/blca-003/blca/tiles-l1-s224/feats-l1-s224-CTransPath-sampler"
+        "wsi_dir": "WSIs/blca-003/pt_files"
       }
     },
     "brca": {
@@ -68,7 +73,7 @@
         "omics_file": "datasets_csv/raw_rna_data/combine/brca/rna_clean.csv",
         "clinical_file": "datasets_csv/clinical_data/tcga_brca_clinical.csv",
         "signature_file": "datasets_csv/metadata/combine_signatures.csv",
-        "wsi_dir": "WSIs/brca-004/brca/tiles-l1-s224/feats-l1-s224-CTransPath-sampler"
+        "wsi_dir": "WSIs/brca-004/brca/pt_files"
       }
     },
     "coadread": {
@@ -78,7 +83,7 @@
         "omics_file": "datasets_csv/raw_rna_data/combine/coadread/rna_clean.csv",
         "clinical_file": "datasets_csv/clinical_data/tcga_coadread_clinical.csv",
         "signature_file": "datasets_csv/metadata/combine_signatures.csv",
-        "wsi_dir": "WSIs/coadread-005/coadread/tiles-l1-s224/feats-l1-s224-CTransPath-sampler"
+        "wsi_dir": "WSIs/coadread-005/pt_files"
       }
     },
     "hnsc": {
@@ -88,7 +93,7 @@
         "omics_file": "datasets_csv/raw_rna_data/combine/hnsc/rna_clean.csv",
         "clinical_file": "datasets_csv/clinical_data/tcga_hnsc_clinical.csv",
         "signature_file": "datasets_csv/metadata/combine_signatures.csv",
-        "wsi_dir": "WSIs/hnsc-001/hnsc/tiles-l1-s224/feats-l1-s224-CTransPath-sampler"
+        "wsi_dir": "WSIs/hnsc-001/pt_files"
       }
     },
     "stad": {
@@ -98,7 +103,7 @@
         "omics_file": "datasets_csv/raw_rna_data/combine/stad/rna_clean.csv",
         "clinical_file": "datasets_csv/clinical_data/tcga_stad_clinical.csv",
         "signature_file": "datasets_csv/metadata/combine_signatures.csv",
-        "wsi_dir": "WSIs/stad-002/stad/tiles-l1-s224/feats-l1-s224-CTransPath-sampler"
+        "wsi_dir": "WSIs/stad-002/pt_files"
       }
     }
   }

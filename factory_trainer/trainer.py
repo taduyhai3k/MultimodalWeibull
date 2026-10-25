@@ -204,7 +204,18 @@ class Trainer:
                 for p in params:p.requires_grad_(False)
                 losses=self.criterion(output,b['y'],b['time'],b['censor'])
                 if 'total' not in losses:raise KeyError('criterion must return dict with total')
-                if not all(torch.isfinite(v).all() for v in losses.values()):raise FloatingPointError('Nonfinite training loss')
+                bad_losses = {
+                    name: value.detach().cpu().tolist()
+                    for name, value in losses.items()
+                    if not torch.isfinite(value).all().item()
+                }
+
+                if bad_losses:
+                    raise FloatingPointError(
+                        f"Nonfinite training loss: {bad_losses}; "
+                        f"batch_indices={b['index']}"
+                    )
+                #if not all(torch.isfinite(v).all() for v in losses.values()):raise FloatingPointError('Nonfinite training loss')
                 losses['total'].backward()
             finally:
                 for p,flag in zip(params,flags):p.requires_grad_(flag)
