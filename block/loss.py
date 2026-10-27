@@ -378,23 +378,37 @@ def get_KL_loss(
     )
 
 class PIBDWeibullLoss(nn.Module):
-    """PIBD-inspired objective using this project's Gaussian CLUB and Weibull NLL.
+    """PIBD-inspired objective with Weibull NLL and optional expectation MSE."""
 
-    Coefficients are configurable starting values, not official PIBD settings.
-    MI estimators must be fitted separately using club_learning_loss().
-    """
-    def __init__(self, hidden_dim=128,survival_weight=2.0,proxy_weight=1.0, kl_weight=1e-2,
-                 alignment_weight=1.0, mi_weight=1):
+    def __init__(
+        self,
+        hidden_dim=128,
+        survival_weight=2.0,
+        proxy_weight=1.0,
+        kl_weight=1e-2,
+        alignment_weight=1.0,
+        mi_weight=1.0,
+        expectation_mse_weight=0.01,
+        expectation_eps=1e-7,
+    ):
         super().__init__()
+
+        if expectation_mse_weight < 0:
+            raise ValueError("expectation_mse_weight must be >= 0")
+
         self.weibull = WeibullLossandInference()
+
         self.survival_weight = survival_weight
         self.proxy_weight = proxy_weight
         self.kl_weight = kl_weight
         self.alignment_weight = alignment_weight
         self.mi_weight = mi_weight
-        # I(H;P) + I([H,P];G): modality-specific and common representations.
+
+        self.expectation_mse_weight = expectation_mse_weight
+        self.expectation_eps = expectation_eps
+
         self.club_hp = CLUBStable(hidden_dim, hidden_dim)
-        self.club_common = CLUBStable(2*hidden_dim, hidden_dim)
+        self.club_common = CLUBStable(2 * hidden_dim, hidden_dim)
 
     def club_parameters(self):
         return list(self.club_hp.parameters()) + list(self.club_common.parameters())
@@ -403,6 +417,96 @@ class PIBDWeibullLoss(nn.Module):
         h, p, g = (v.detach().float() for v in output['features'])
         return (self.club_hp.loss_loglikelihood(h, p)
                 + self.club_common.loss_loglikelihood(torch.cat([h, p], -1), g))
+    def expectation_mse(self, output, event_time, censor):
+        """
+        Tính MSE giữa kỳ vọng Weibull mixture và thời gian sự kiện.
+
+        censor:
+            0: có sự kiện
+            1: censored
+
+        Chỉ bệnh nhân có sự kiện được dùng trong MSE.
+        """
+
+        x = output["x"].float()
+        event_time = event_time.reshape(-1).to(
+            device=x.device,
+            dtype=x.dtype,
+        )
+        censor = censor.reshape(-1).to(device=x.device)
+
+        event_mask = censor == 0
+
+        # Nếu batch toàn censored, MSE không đóng góp gradient.
+        if not event_mask.any():
+            return x.sum() * 0.0
+
+        # Chỉ lấy bệnh nhân có sự kiện.
+        x_event = x[event_mask]
+        times_event = event_time[event_mask]
+
+        shape_coeffs = output["shapes"][event_mask].float()
+        rate_coeffs = output["scales"][event_mask].float()
+        weights = output["weights"][event_mask].float()
+
+        # [B_event, M, D] × [B_event, D] -> [B_event, M]
+        shape_logits = torch.einsum(
+            "bd,bmd->bm",
+            x_event,
+            shape_coeffs,
+        )
+
+        rate_logits = torch.einsum(
+            "bd,bmd->bm",
+            x_event,
+            rate_coeffs,
+        )
+
+        shape = torch.nn.functional.softplus(
+            shape_logits
+        ) + self.expectation_eps
+
+        rate = torch.nn.functional.softplus(
+            rate_logits
+        ) + self.expectation_eps
+
+        weights = weights.clamp_min(self.expectation_eps)
+        weights = weights / weights.sum(dim=-1, keepdim=True)
+
+        # Quy ước: S_m(t) = exp(-rate_m * t**shape_m)
+        #
+        # E[T_m] = rate_m ** (-1 / shape_m)
+        #          * Gamma(1 + 1 / shape_m)
+        log_component_expectation = (
+            torch.lgamma(1.0 + 1.0 / shape)
+            - torch.log(rate) / shape
+        )
+
+        component_expectation = torch.exp(log_component_expectation)
+
+        # [B_event, M] -> [B_event]
+        predicted_expectation = (
+            weights * component_expectation
+        ).sum(dim=-1)
+
+        if not torch.isfinite(predicted_expectation).all():
+            raise FloatingPointError(
+                "Weibull expectation contains NaN or Inf. "
+                "Check shape and rate."
+            )
+
+        mse = torch.nn.functional.mse_loss(
+            predicted_expectation,
+            times_event,
+            reduction="mean",
+        )
+
+        if not torch.isfinite(mse):
+            raise FloatingPointError(
+                "Expectation MSE contains NaN or Inf."
+            )
+
+        return mse
 
     def forward(self, output, bins, event_time, censor):
         x = output['x'].float()
@@ -442,7 +546,36 @@ class PIBDWeibullLoss(nn.Module):
         finally:
             for v, state in zip(params, states):
                 v.requires_grad_(state)
-        total = (self.survival_weight * survival + self.proxy_weight*proxy + self.kl_weight*kl
-                 + self.alignment_weight*alignment + self.mi_weight*mi)
-        return dict(total=total, survival=survival, proxy=proxy, kl=kl,
-                    alignment=alignment, mi=mi)
+        total_before_mse = (
+            self.survival_weight * survival
+            + self.proxy_weight * proxy
+            + self.kl_weight * kl
+            + self.alignment_weight * alignment
+            + self.mi_weight * mi
+        )
+
+        if self.expectation_mse_weight > 0:
+            mse = self.expectation_mse(
+                output=output,
+                event_time=event_time,
+                censor=censor,
+            )
+        else:
+            # Không tính expectation khi tắt MSE.
+            # Nhờ đó tránh tràn số không cần thiết.
+            mse = x.new_zeros(())
+
+        weighted_mse = self.expectation_mse_weight * mse
+        total = total_before_mse + weighted_mse
+
+        return {
+            "total": total,
+            "total_before_mse": total_before_mse,
+            "survival": survival,
+            "proxy": proxy,
+            "kl": kl,
+            "alignment": alignment,
+            "mi": mi,
+            "expectation_mse": mse,
+            "expectation_mse_weighted": weighted_mse,
+        }

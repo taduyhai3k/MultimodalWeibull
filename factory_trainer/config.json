@@ -33,7 +33,9 @@
     "proxy_weight": 0.5,
     "kl_weight": 1e-2,
     "alignment_weight": 1.0,
-    "mi_weight": 0.5
+    "mi_weight": 0.5,
+    "expectation_mse_weight": 0.001,
+    "expectation_eps": 1e-7
   },
   "training": {
     "epochs": 100,
