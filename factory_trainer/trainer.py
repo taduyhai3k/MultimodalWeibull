@@ -87,6 +87,95 @@ def actual_parameters(output,eps):
     weight=output['weights'].float().clamp_min(eps);weight=weight/weight.sum(-1,keepdim=True)
     return shape,rate,weight
 
+def expectation_mse(output, times, censor, eps=1e-7):
+    """
+    MSE giữa kỳ vọng Weibull mixture và thời gian sự kiện.
+
+    Quy ước censor:
+        0: đã xảy ra sự kiện
+        1: bị censor
+
+    Parameters
+    ----------
+    output:
+        Dictionary do model(..., return_aux=True) trả về.
+
+    times:
+        Thời gian ở cùng đơn vị dùng để train Weibull.
+        Shape [B] hoặc [B, 1].
+
+    censor:
+        Trạng thái censor. Shape [B] hoặc [B, 1].
+
+    Returns
+    -------
+    mse:
+        Scalar tensor còn gradient.
+
+    n_events:
+        Số bệnh nhân có sự kiện trong batch.
+    """
+
+    # Chỉ tính trên bệnh nhân có sự kiện.
+    event_mask = censor.reshape(-1) == 0
+    n_events = int(event_mask.sum().item())
+
+    if n_events == 0:
+        # Batch toàn censored: MSE bằng 0, không đóng góp gradient.
+        return output["x"].sum() * 0.0, 0
+
+    # Chỉ lấy những mẫu có sự kiện trước khi tính kỳ vọng.
+    x = output["x"][event_mask].float()
+    shape_coeffs = output["shapes"][event_mask].float()
+    rate_coeffs = output["scales"][event_mask].float()
+    weights = output["weights"][event_mask].float()
+
+    targets = times.reshape(-1)[event_mask].float()
+
+    # shapes và scales trong output là hệ số [B, M, D],
+    # chưa phải tham số Weibull cuối cùng.
+    shape = torch.nn.functional.softplus(
+        torch.einsum("bd,bmd->bm", x, shape_coeffs)
+    ) + eps
+
+    rate = torch.nn.functional.softplus(
+        torch.einsum("bd,bmd->bm", x, rate_coeffs)
+    ) + eps
+
+    weights = weights / weights.sum(
+        dim=-1, keepdim=True
+    ).clamp_min(eps)
+
+    # S(t) = exp(-rate * t**shape)
+    #
+    # E[T_m] = rate**(-1 / shape) * Gamma(1 + 1 / shape)
+    log_component_mean = (
+        torch.lgamma(1.0 + 1.0 / shape)
+        - torch.log(rate) / shape
+    )
+
+    component_mean = torch.exp(log_component_mean)
+    predicted_mean = (weights * component_mean).sum(dim=-1)
+
+    if not torch.isfinite(predicted_mean).all():
+        raise FloatingPointError(
+            "Weibull expectation is NaN/Inf. "
+            "Inspect shape, rate and log_component_mean."
+        )
+
+    mse = torch.nn.functional.mse_loss(
+        predicted_mean,
+        targets,
+        reduction="mean",
+    )
+
+    if not torch.isfinite(mse):
+        raise FloatingPointError("Expectation MSE is NaN/Inf.")
+
+    return mse, n_events
+
+
+
 
 @torch.no_grad()
 def predict_parameters(model,b):
@@ -113,9 +202,9 @@ class Trainer:
         self.train_dataset=train_dataset;self.val_dataset=val_dataset;self.preprocessing=preprocessing
         self.opt=torch.optim.AdamW(self.model.parameters(),lr=config.get('lr',1e-4),weight_decay=config.get('weight_decay',1e-4))
         self.club_opt=torch.optim.Adam(self.criterion.club_parameters(),lr=config.get('club_lr',1e-4))
-        self.scheduler=torch.optim.lr_scheduler.ReduceLROnPlateau(self.opt,mode='min',factor=.5,patience=config.get('lr_patience',5))
+        self.scheduler=torch.optim.lr_scheduler.ReduceLROnPlateau(self.opt,mode='max',factor=.5,patience=config.get('lr_patience',5))
         self.seed=config.get('seed',42);self.generator=torch.Generator().manual_seed(self.seed)
-        self.history=[];self.step=0;self.start=0;self.best=float('inf');self.bad=0
+        self.history=[];self.step=0;self.start=0;self.best=float('-inf');self.bad=0
         self.fingerprint=self._fingerprint()
         self._validate_contract()
         if config.get('resume',False):self._restore()
@@ -308,7 +397,20 @@ class Trainer:
                 train_eval={}
                 if number%self.cfg.get('train_eval_every',1)==0:
                     train_eval=self.evaluate(self.train_dataset,'train_eval',number,auxiliary=False)
-                score=val['nll'];improved=score<self.best-self.cfg.get('min_delta',0.)
+                score = val["c_index"]
+
+                # C-index không xác định nếu tập validation không có cặp hợp lệ.
+                if score is None or not np.isfinite(score):
+                    raise ValueError(
+                        "Validation C-index is undefined or non-finite. "
+                        f"Comparable pairs: {val.get('comparable_pairs')}. "
+                        "Check event/censor labels and validation split."
+                    )
+
+                min_delta = float(self.cfg.get("min_delta", 0.0))
+
+                # C-index càng lớn càng tốt.
+                improved = score > self.best + min_delta
                 if improved:self.best=score;self.bad=0
                 else:self.bad+=1
                 self.scheduler.step(score)
@@ -320,7 +422,17 @@ class Trainer:
                 self._record(record);state=self._state(epoch)
                 checkpoint(self.out/'last.pt',state)
                 if improved:checkpoint(self.out/'best.pt',state)
-                logging.info('epoch=%d train_total=%.5g val_nll=%.5g val_cindex=%s PoE=%s',number,train_loss['total'],score,val['c_index'],record['poe_alpha'])
+                logging.info(
+                    "epoch=%d train_total=%.5g val_nll=%.5g "
+                    "val_cindex=%.5g best_cindex=%.5g bad=%d PoE=%s",
+                    number,
+                    train_loss["total"],
+                    val["nll"],
+                    val["c_index"],
+                    self.best,
+                    self.bad,
+                    record["poe_alpha"],
+                )
             if not (self.out/'best.pt').exists():raise RuntimeError('No completed epoch/checkpoint')
             best=torch.load(self.out/'best.pt',map_location='cpu',weights_only=False)
             self.model.load_state_dict(best['model']);self.criterion.load_state_dict(best['criterion'])

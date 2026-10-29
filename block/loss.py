@@ -390,6 +390,8 @@ class PIBDWeibullLoss(nn.Module):
         mi_weight=1.0,
         expectation_mse_weight=0.01,
         expectation_eps=1e-7,
+        lambda_floor=0.01,
+        lambda_penalty_weight=0.0,
     ):
         super().__init__()
 
@@ -406,6 +408,15 @@ class PIBDWeibullLoss(nn.Module):
 
         self.expectation_mse_weight = expectation_mse_weight
         self.expectation_eps = expectation_eps
+
+        if lambda_floor <= 0:
+            raise ValueError("lambda_floor must be > 0")
+
+        if lambda_penalty_weight < 0:
+            raise ValueError("lambda_penalty_weight must be >= 0")
+
+        self.lambda_floor = float(lambda_floor)
+        self.lambda_penalty_weight = float(lambda_penalty_weight)
 
         self.club_hp = CLUBStable(hidden_dim, hidden_dim)
         self.club_common = CLUBStable(2 * hidden_dim, hidden_dim)
@@ -507,6 +518,31 @@ class PIBDWeibullLoss(nn.Module):
             )
 
         return mse
+    def lambda_regularization(self, output):
+        """
+        Phạt khi Weibull rate lambda nhỏ hơn lambda_floor.
+
+        output["x"]:      [B, D]
+        output["scales"]: [B, M, D] — các hệ số, chưa phải lambda.
+        """
+
+        x = output["x"].float()
+        rate_coeffs = output["scales"].float()
+
+        rate_logits = torch.einsum(
+            "bd,bmd->bm",
+            x,
+            rate_coeffs,
+        )
+
+        # Dùng cùng eps với WeibullLossandInference.
+        rate = torch.nn.functional.softplus(rate_logits) + self.weibull.eps
+
+        penalty = torch.relu(
+            self.lambda_floor - rate
+        ).square().mean()
+
+        return penalty
 
     def forward(self, output, bins, event_time, censor):
         x = output['x'].float()
@@ -551,7 +587,7 @@ class PIBDWeibullLoss(nn.Module):
             + self.proxy_weight * proxy
             + self.kl_weight * kl
             + self.alignment_weight * alignment
-            + self.mi_weight * mi
+            + self.mi_weight * mi + self.lambda_penalty_weight * self.lambda_regularization(output)
         )
 
         if self.expectation_mse_weight > 0:
