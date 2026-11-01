@@ -3,6 +3,9 @@ from collections.abc import Sequence
 import torch
 import torch.nn as nn
 from .blocks import ResidualBlock, Proxies
+import torch.nn.functional as F
+
+from .blocks import ResidualBlock, Proxies
 
 class FeatureEncoder(nn.Module):
     def __init__(self, input_dim:int, hidden_dim:int, num_blocks:int, dropout:float=0.1):
@@ -15,127 +18,723 @@ class FeatureEncoder(nn.Module):
             out = block(out)
         return out
     
+# class ModalEncoder(nn.Module):
+#     def __init__(self, input_dim:int, hidden_dim:int, num_blocks:int, dropout:float, num_proxies:int, top_k:int, sample_num:int, seed:int, beta:float):
+#         super(ModalEncoder, self).__init__()
+#         self.input_linear = nn.Linear(input_dim, hidden_dim)
+#         self.encoder = nn.ModuleList([ResidualBlock(hidden_dim, dropout) for _ in range(num_blocks)])
+#         self.proxies = Proxies(dim=hidden_dim, num_proxies=num_proxies)
+#         self.decoder = nn.Linear(hidden_dim, num_proxies)
+#         self.num_proxies = num_proxies
+#         self.hidden_dim = hidden_dim
+#         self.top_k = top_k
+#         self.sample_num = sample_num
+#         self.beta = beta
+#         self.seed = seed
+#         self.dropout = dropout
+#     def gaussian_noise_train(self):
+#         return torch.normal(torch.zeros(self.num_proxies, self.sample_num, self.hidden_dim), torch.ones(self.num_proxies, self.sample_num, self.hidden_dim))
+#     def gaussian_noise_inference(self):
+#         return torch.normal(torch.zeros(self.num_proxies, self.sample_num, self.hidden_dim), torch.ones(self.num_proxies, self.sample_num, self.hidden_dim), generator= torch.manual_seed(self.seed))
+#     def forward(self, x, y, c,  mask = None ):
+#         histfeatures = self.input_linear(x)
+#         for block in self.encoder:
+#             histfeatures = block(histfeatures)
+#         mu_proxies, sigma_proxies = self.proxies()
+#         noise = self.gaussian_noise_train().to(device= mu_proxies.device, dtype=mu_proxies.dtype)
+#         sampled_proxies = mu_proxies.unsqueeze(1) + sigma_proxies.unsqueeze(1) * noise
+#         mean_proxies = nn.functional.normalize(torch.mean(sampled_proxies, dim=1), dim=-1).unsqueeze(0)
+#         histfeatures = nn.functional.normalize(histfeatures, dim=-1)
+#         similarity = torch.matmul(histfeatures, mean_proxies.transpose(1, 2))
+#         B, N, P = similarity.shape
+#         if mask is None:
+#             padding_mask = torch.zeros((B, N), dtype=torch.bool, device=similarity.device)
+#         else:
+#             padding_mask = mask.to(
+#                 device=similarity.device,
+#                 dtype=torch.bool
+#             )
+#         valid_patch_mask = ~padding_mask
+#         if padding_mask.shape != (B, N):
+#             raise ValueError(
+#                 f"mask phải có shape {(B, N)}, "
+#                 f"nhưng nhận được {tuple(padding_mask.shape)}"
+#             )
+#         similarity = similarity.masked_fill(
+#         padding_mask.unsqueeze(-1),
+#         float("-inf")
+#         )   
+#         y = y.reshape(-1).to(device=x.device, dtype=torch.long)
+#         c = c.reshape(-1).to(device=x.device, dtype=torch.long)
+
+#         proxies_indice = self.proxies.proxy_lookup[y, c]
+#         batch_idx = torch.arange(x.size(0), device=x.device)
+#         similarity_positive = similarity[batch_idx, :, proxies_indice].unsqueeze(-1)
+#         all_proxy_indices = torch.arange(
+#             P,
+#             device=similarity.device
+#         ).unsqueeze(0).expand(B, P)
+#         negative_indices = all_proxy_indices[
+#             all_proxy_indices != proxies_indice.unsqueeze(1)
+#         ].view(B, P - 1)
+#         # Mở rộng theo N feature
+#         negative_indices = negative_indices.unsqueeze(1).expand(
+#             B, N, P - 1
+#         )
+#         similarity_negative = torch.gather(
+#             similarity,
+#             dim=2,
+#             index=negative_indices
+#         )
+#         similarity_topk_positive, index_p = torch.topk(similarity_positive.squeeze(-1), self.top_k, dim = 1)
+#         similarity_topk_negative, index_n = torch.topk(similarity_negative, self.top_k, dim = 1)
+#         mask_positive = torch.gather(input=valid_patch_mask, dim=1, index=index_p)
+#         mask_negative = torch.gather(input=valid_patch_mask.unsqueeze(-1).expand(-1, -1, similarity_topk_negative.size(-1)), dim=1, index=index_n)
+#         positive = similarity_topk_positive.masked_fill(
+#             ~mask_positive, 0.0
+#         )
+#         negative = similarity_topk_negative.masked_fill(
+#             ~mask_negative, 0.0
+#         )
+
+#         similarity_positive_mean = (
+#             positive.sum(dim=1)
+#             / mask_positive.sum(dim=1).clamp_min(1)
+#         )
+#         similarity_negative_mean = (
+#             negative.sum(dim=(1, 2))
+#             / mask_negative.sum(dim=(1, 2)).clamp_min(1)
+#         )
+#         #similarity_positive_mean = torch.mean(similarity_topk_positive * mask_positive, dim=1)
+#         #similarity_negative_mean = torch.mean(similarity_topk_negative * mask_negative, dim=(1,2))
+#         mu_true = mu_proxies[proxies_indice]
+#         sigma_true = sigma_proxies[proxies_indice]
+#         similarity_unbind = similarity.view(similarity.size(0), -1)
+#         _, similarity_topk_idx = torch.topk(similarity_unbind, self.top_k, dim=1)
+#         similarity_topk_idx = torch.div(similarity_topk_idx, self.num_proxies, rounding_mode='floor')
+#         #similarity_topk_idx = similarity_topk_idx % similarity.size(1)
+#         gather_index = similarity_topk_idx.unsqueeze(-1).expand(-1, -1, self.hidden_dim)
+#         histfeatures_topk = torch.gather(histfeatures, 1, gather_index)
+#         logits = torch.mean(self.decoder(sampled_proxies), dim = 1)
+#         return similarity_positive_mean, similarity_negative_mean, mu_true, sigma_true, mu_proxies, sigma_proxies, histfeatures_topk, logits
+#     def predict(self, x):
+#         histfeatures = self.input_linear(x)
+#         for block in self.encoder:
+#             histfeatures = block(histfeatures)
+#         mu_proxies, sigma_proxies = self.proxies()
+#         noise = self.gaussian_noise_inference().to(device=mu_proxies.device, dtype=mu_proxies.dtype)
+#         sampled_proxies = mu_proxies.unsqueeze(1) + sigma_proxies.unsqueeze(1) * noise
+#         mean_proxies = nn.functional.normalize(torch.mean(sampled_proxies, dim=1), dim=-1).unsqueeze(0)
+#         histfeatures = nn.functional.normalize(histfeatures, dim=-1)
+#         similarity = torch.matmul(histfeatures, mean_proxies.transpose(1, 2))
+#         similarity_unbind = similarity.view(similarity.size(0), -1)
+#         _, similarity_topk_idx = torch.topk(similarity_unbind, self.top_k, dim=1)
+#         proxies_topk_idx = similarity_topk_idx % self.num_proxies
+#         similarity_topk_idx = torch.div(similarity_topk_idx, self.num_proxies, rounding_mode='floor')
+#         proxies_indice = torch.mode(proxies_topk_idx, dim =1).values
+#         mu_true = mu_proxies[proxies_indice]
+#         sigma_true = sigma_proxies[proxies_indice]
+#         gather_index = similarity_topk_idx.unsqueeze(-1).expand(-1, -1, self.hidden_dim)
+#         histfeatures_topk = torch.gather(histfeatures, 1, gather_index)
+#         logits = torch.mean(self.decoder(sampled_proxies), dim = 1)
+#         return mu_true, sigma_true,  mu_proxies, sigma_proxies, histfeatures_topk, logits
+    
+
+
+
 class ModalEncoder(nn.Module):
-    def __init__(self, input_dim:int, hidden_dim:int, num_blocks:int, dropout:float, num_proxies:int, top_k:int, sample_num:int, seed:int, beta:float):
-        super(ModalEncoder, self).__init__()
-        self.input_linear = nn.Linear(input_dim, hidden_dim)
-        self.encoder = nn.ModuleList([ResidualBlock(hidden_dim, dropout) for _ in range(num_blocks)])
-        self.proxies = Proxies(dim=hidden_dim, num_proxies=num_proxies)
-        self.decoder = nn.Linear(hidden_dim, num_proxies)
+    """
+    Encoder cho một modality: histology hoặc pathway.
+
+    Quy ước mask:
+        False = token thật
+        True  = padding
+
+    Forward:
+        Chọn top-k token theo proxy đúng từ (y, c).
+
+    Predict:
+        Không sử dụng nhãn.
+        Chọn proxy dự đoán từ similarity, sau đó chọn top-k
+        token theo proxy dự đoán.
+
+    Đầu ra forward mặc định:
+        8 tensor giống thứ tự cũ.
+
+    Nếu return_triplet=True:
+        Trả thêm dictionary triplet ở vị trí thứ 9.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        num_blocks: int,
+        dropout: float,
+        num_proxies: int,
+        top_k: int,
+        sample_num: int,
+        seed: int,
+        beta: float,
+    ):
+        super().__init__()
+
+        if num_proxies < 2 or num_proxies % 2 != 0:
+            raise ValueError(
+                "num_proxies phải là số chẵn và >= 2 "
+                "với proxy_lookup hiện tại."
+            )
+
+        if top_k <= 0:
+            raise ValueError("top_k phải > 0.")
+
+        if sample_num <= 0:
+            raise ValueError("sample_num phải > 0.")
+
+        self.input_linear = nn.Linear(
+            input_dim,
+            hidden_dim,
+        )
+
+        self.encoder = nn.ModuleList([
+            ResidualBlock(hidden_dim, dropout)
+            for _ in range(num_blocks)
+        ])
+
+        self.proxies = Proxies(
+            dim=hidden_dim,
+            num_proxies=num_proxies,
+        )
+
+        # Giữ nguyên output dimension như code cũ của em.
+        self.decoder = nn.Linear(
+            hidden_dim,
+            num_proxies,
+        )
+
         self.num_proxies = num_proxies
         self.hidden_dim = hidden_dim
         self.top_k = top_k
         self.sample_num = sample_num
-        self.beta = beta
         self.seed = seed
+        self.beta = beta
         self.dropout = dropout
-    def gaussian_noise_train(self):
-        return torch.normal(torch.zeros(self.num_proxies, self.sample_num, self.hidden_dim), torch.ones(self.num_proxies, self.sample_num, self.hidden_dim))
-    def gaussian_noise_inference(self):
-        return torch.normal(torch.zeros(self.num_proxies, self.sample_num, self.hidden_dim), torch.ones(self.num_proxies, self.sample_num, self.hidden_dim), generator= torch.manual_seed(self.seed))
-    def forward(self, x, y, c,  mask = None ):
-        histfeatures = self.input_linear(x)
+
+    def _encode(self, x):
+        """
+        x: [B, N, input_dim]
+        return: [B, N, hidden_dim], đã L2 normalize.
+        """
+        if x.ndim != 3:
+            raise ValueError(
+                f"x phải có shape [B, N, D], "
+                f"nhận được {tuple(x.shape)}"
+            )
+
+        if x.size(0) == 0 or x.size(1) == 0:
+            raise ValueError("Batch và số token phải > 0.")
+
+        features = self.input_linear(x)
+
         for block in self.encoder:
-            histfeatures = block(histfeatures)
+            features = block(features)
+
+        return F.normalize(features, p=2, dim=-1)
+
+    def _sample_proxies(self, deterministic=False):
+        """
+        Sinh mẫu proxy bằng reparameterization.
+
+        deterministic=False:
+            Dùng RNG hiện tại cho training.
+
+        deterministic=True:
+            Dùng generator riêng với seed cố định cho inference;
+            không thay đổi seed toàn cục.
+        """
         mu_proxies, sigma_proxies = self.proxies()
-        noise = self.gaussian_noise_train().to(device= mu_proxies.device, dtype=mu_proxies.dtype)
-        sampled_proxies = mu_proxies.unsqueeze(1) + sigma_proxies.unsqueeze(1) * noise
-        mean_proxies = nn.functional.normalize(torch.mean(sampled_proxies, dim=1), dim=-1).unsqueeze(0)
-        histfeatures = nn.functional.normalize(histfeatures, dim=-1)
-        similarity = torch.matmul(histfeatures, mean_proxies.transpose(1, 2))
-        B, N, P = similarity.shape
+
+        generator = None
+
+        if deterministic:
+            generator = torch.Generator(device=mu_proxies.device)
+            generator.manual_seed(self.seed)
+
+        noise = torch.randn(
+            self.num_proxies,
+            self.sample_num,
+            self.hidden_dim,
+            device=mu_proxies.device,
+            dtype=mu_proxies.dtype,
+            generator=generator,
+        )
+
+        sampled_proxies = (
+            mu_proxies.unsqueeze(1)
+            + sigma_proxies.unsqueeze(1) * noise
+        )  # [P, S, H]
+
+        mean_proxies = F.normalize(
+            sampled_proxies.mean(dim=1),
+            p=2,
+            dim=-1,
+        )  # [P, H]
+
+        logits = self.decoder(
+            sampled_proxies
+        ).mean(dim=1)  # [P, num_proxies]
+
+        return (
+            mu_proxies,
+            sigma_proxies,
+            sampled_proxies,
+            mean_proxies,
+            logits,
+        )
+
+    @staticmethod
+    def _padding_mask(x, mask):
+        """
+        Trả bool mask [B, N]:
+            True = padding.
+        """
+        B, N = x.shape[:2]
+
         if mask is None:
-            padding_mask = torch.zeros((B, N), dtype=torch.bool, device=similarity.device)
+            padding_mask = torch.zeros(
+                B,
+                N,
+                dtype=torch.bool,
+                device=x.device,
+            )
         else:
             padding_mask = mask.to(
-                device=similarity.device,
-                dtype=torch.bool
+                device=x.device,
+                dtype=torch.bool,
             )
-        valid_patch_mask = ~padding_mask
-        if padding_mask.shape != (B, N):
-            raise ValueError(
-                f"mask phải có shape {(B, N)}, "
-                f"nhưng nhận được {tuple(padding_mask.shape)}"
-            )
-        similarity = similarity.masked_fill(
-        padding_mask.unsqueeze(-1),
-        float("-inf")
-        )   
-        y = y.reshape(-1).to(device=x.device, dtype=torch.long)
-        c = c.reshape(-1).to(device=x.device, dtype=torch.long)
 
-        proxies_indice = self.proxies.proxy_lookup[y, c]
-        batch_idx = torch.arange(x.size(0), device=x.device)
-        similarity_positive = similarity[batch_idx, :, proxies_indice].unsqueeze(-1)
-        all_proxy_indices = torch.arange(
-            P,
-            device=similarity.device
-        ).unsqueeze(0).expand(B, P)
-        negative_indices = all_proxy_indices[
-            all_proxy_indices != proxies_indice.unsqueeze(1)
-        ].view(B, P - 1)
-        # Mở rộng theo N feature
-        negative_indices = negative_indices.unsqueeze(1).expand(
-            B, N, P - 1
+            if padding_mask.shape != (B, N):
+                raise ValueError(
+                    f"mask phải có shape {(B, N)}, "
+                    f"nhận được {tuple(padding_mask.shape)}."
+                )
+
+        valid_counts = (~padding_mask).sum(dim=1)
+
+        if (valid_counts == 0).any():
+            bad_rows = torch.nonzero(
+                valid_counts == 0,
+                as_tuple=False,
+            ).flatten().tolist()
+
+            raise ValueError(
+                "Mỗi bệnh nhân phải có ít nhất một token thật. "
+                f"Batch indices không hợp lệ: {bad_rows}"
+            )
+
+        return padding_mask
+
+    def _label_to_proxy(self, y, c, batch_size, device):
+        """
+        Quy ước proxy_lookup:
+            y = bin thời gian
+            c = 0 hoặc 1
+        """
+        y = y.reshape(-1).to(device=device, dtype=torch.long)
+        c = c.reshape(-1).to(device=device, dtype=torch.long)
+
+        if y.numel() != batch_size or c.numel() != batch_size:
+            raise ValueError(
+                "y và c phải có đúng một giá trị cho mỗi bệnh nhân."
+            )
+
+        lookup = self.proxies.proxy_lookup
+
+        if ((y < 0) | (y >= lookup.size(0))).any():
+            raise ValueError(
+                f"y phải nằm trong [0, {lookup.size(0) - 1}]. "
+                "Kiểm tra y có phải bin thời gian hay không."
+            )
+
+        if ((c < 0) | (c >= lookup.size(1))).any():
+            raise ValueError(
+                "c phải tương ứng với cột của proxy_lookup "
+                "(thông thường 0 hoặc 1)."
+            )
+
+        return lookup[y, c]  # [B]
+
+    def _topk_by_proxy(
+        self,
+        features,
+        similarity,
+        proxy_idx,
+        padding_mask,
+    ):
+        """
+        Chọn feature theo một proxy cho từng bệnh nhân.
+
+        features:     [B, N, H]
+        similarity:   [B, N, P]
+        proxy_idx:    [B]
+        padding_mask: [B, N], True = padding
+
+        Returns
+        -------
+        selected:
+            [B, top_k, H], nếu thiếu token thì lặp token thật.
+
+        selected_mask:
+            [B, top_k], True = token được chọn hợp lệ,
+            False = vị trí được lặp để đủ kích thước.
+
+        top_values:
+            [B, min(top_k, N)], similarity; có thể chứa -inf
+            tại vị trí padding.
+
+        raw_valid:
+            [B, min(top_k, N)], True nếu index tương ứng token thật.
+        """
+        B, N, H = features.shape
+        K0 = min(self.top_k, N)
+
+        batch_idx = torch.arange(
+            B,
+            device=features.device,
         )
-        similarity_negative = torch.gather(
+
+        selected_similarity = similarity[
+            batch_idx, :, proxy_idx
+        ]  # [B, N]
+
+        masked_similarity = selected_similarity.masked_fill(
+            padding_mask,
+            float("-inf"),
+        )
+
+        top_values, top_indices = torch.topk(
+            masked_similarity,
+            k=K0,
+            dim=1,
+        )
+
+        raw_valid = torch.gather(
+            ~padding_mask,
+            dim=1,
+            index=top_indices,
+        )  # [B, K0]
+
+        # Mỗi bệnh nhân đã được kiểm tra có ít nhất 1 token thật.
+        # Thay index padding bằng token thật đầu tiên trong top-k.
+        fallback = top_indices[:, :1].expand_as(top_indices)
+
+        safe_indices = torch.where(
+            raw_valid,
+            top_indices,
+            fallback,
+        )
+
+        # Nếu top_k > N, bổ sung thêm bản sao của token thật.
+        if self.top_k > K0:
+            extra_count = self.top_k - K0
+
+            extra_indices = top_indices[:, :1].expand(
+                B,
+                extra_count,
+            )
+
+            safe_indices = torch.cat(
+                [safe_indices, extra_indices],
+                dim=1,
+            )
+
+            extra_valid = torch.zeros(
+                B,
+                extra_count,
+                dtype=torch.bool,
+                device=features.device,
+            )
+
+            selected_mask = torch.cat(
+                [raw_valid, extra_valid],
+                dim=1,
+            )
+        else:
+            selected_mask = raw_valid
+
+        selected = torch.gather(
+            features,
+            dim=1,
+            index=safe_indices.unsqueeze(-1).expand(
+                -1, -1, H
+            ),
+        )
+
+        return selected, selected_mask, top_values, raw_valid
+
+    def forward(
+        self,
+        x,
+        y,
+        c,
+        mask=None,
+        return_triplet=True,
+    ):
+        """
+        Training: chọn top-k theo proxy đúng.
+
+        y:
+            Bin thời gian, không phải label_discrete = 2*y+c.
+
+        c:
+            Censor: 0 hoặc 1.
+
+        Nếu return_triplet=True, trả thêm dictionary để tính loss.
+        """
+        features = self._encode(x)
+
+        B, N, H = features.shape
+        padding_mask = self._padding_mask(x, mask)
+
+        (
+            mu_proxies,
+            sigma_proxies,
+            _,
+            mean_proxies,
+            logits,
+        ) = self._sample_proxies(deterministic=False)
+
+        # [B, N, H] @ [H, P] -> [B, N, P]
+        similarity = features @ mean_proxies.transpose(0, 1)
+
+        proxy_idx = self._label_to_proxy(
+            y,
+            c,
+            batch_size=B,
+            device=x.device,
+        )
+
+        # ---------------------------------------------------------
+        # 1. Chọn top-k feature theo PROXY ĐÚNG.
+        # ---------------------------------------------------------
+        (
+            features_topk,
+            features_topk_mask,
+            positive_values,
+            positive_valid,
+        ) = self._topk_by_proxy(
+            features=features,
+            similarity=similarity,
+            proxy_idx=proxy_idx,
+            padding_mask=padding_mask,
+        )
+
+        # Không nhân -inf với 0.
+        safe_positive = positive_values.masked_fill(
+            ~positive_valid,
+            0.0,
+        )
+
+        positive_mean = (
+            safe_positive.sum(dim=1)
+            / positive_valid.sum(dim=1).clamp_min(1)
+        )  # [B]
+
+        # ---------------------------------------------------------
+        # 2. Giữ cách tính negative mean theo từng proxy sai.
+        # ---------------------------------------------------------
+        K0 = min(self.top_k, N)
+
+        proxy_ids = torch.arange(
+            self.num_proxies,
+            device=x.device,
+        ).unsqueeze(0).expand(B, -1)
+
+        negative_indices = proxy_ids[
+            proxy_ids != proxy_idx.unsqueeze(1)
+        ].reshape(B, self.num_proxies - 1)
+
+        negative_similarity = torch.gather(
             similarity,
             dim=2,
-            index=negative_indices
-        )
-        similarity_topk_positive, index_p = torch.topk(similarity_positive.squeeze(-1), self.top_k, dim = 1)
-        similarity_topk_negative, index_n = torch.topk(similarity_negative, self.top_k, dim = 1)
-        mask_positive = torch.gather(input=valid_patch_mask, dim=1, index=index_p)
-        mask_negative = torch.gather(input=valid_patch_mask.unsqueeze(-1).expand(-1, -1, similarity_topk_negative.size(-1)), dim=1, index=index_n)
-        positive = similarity_topk_positive.masked_fill(
-            ~mask_positive, 0.0
-        )
-        negative = similarity_topk_negative.masked_fill(
-            ~mask_negative, 0.0
+            index=negative_indices.unsqueeze(1).expand(
+                B,
+                N,
+                self.num_proxies - 1,
+            ),
+        )  # [B, N, P-1]
+
+        negative_similarity = negative_similarity.masked_fill(
+            padding_mask.unsqueeze(-1),
+            float("-inf"),
         )
 
-        similarity_positive_mean = (
-            positive.sum(dim=1)
-            / mask_positive.sum(dim=1).clamp_min(1)
+        negative_values, negative_token_idx = torch.topk(
+            negative_similarity,
+            k=K0,
+            dim=1,
         )
-        similarity_negative_mean = (
-            negative.sum(dim=(1, 2))
-            / mask_negative.sum(dim=(1, 2)).clamp_min(1)
+
+        valid_tokens = (~padding_mask).unsqueeze(-1).expand(
+            B,
+            N,
+            self.num_proxies - 1,
         )
-        #similarity_positive_mean = torch.mean(similarity_topk_positive * mask_positive, dim=1)
-        #similarity_negative_mean = torch.mean(similarity_topk_negative * mask_negative, dim=(1,2))
-        mu_true = mu_proxies[proxies_indice]
-        sigma_true = sigma_proxies[proxies_indice]
-        similarity_unbind = similarity.view(similarity.size(0), -1)
-        _, similarity_topk_idx = torch.topk(similarity_unbind, self.top_k, dim=1)
-        similarity_topk_idx = torch.div(similarity_topk_idx, self.num_proxies, rounding_mode='floor')
-        #similarity_topk_idx = similarity_topk_idx % similarity.size(1)
-        gather_index = similarity_topk_idx.unsqueeze(-1).expand(-1, -1, self.hidden_dim)
-        histfeatures_topk = torch.gather(histfeatures, 1, gather_index)
-        logits = torch.mean(self.decoder(sampled_proxies), dim = 1)
-        return similarity_positive_mean, similarity_negative_mean, mu_true, sigma_true, mu_proxies, sigma_proxies, histfeatures_topk, logits
-    def predict(self, x):
-        histfeatures = self.input_linear(x)
-        for block in self.encoder:
-            histfeatures = block(histfeatures)
-        mu_proxies, sigma_proxies = self.proxies()
-        noise = self.gaussian_noise_inference().to(device=mu_proxies.device, dtype=mu_proxies.dtype)
-        sampled_proxies = mu_proxies.unsqueeze(1) + sigma_proxies.unsqueeze(1) * noise
-        mean_proxies = nn.functional.normalize(torch.mean(sampled_proxies, dim=1), dim=-1).unsqueeze(0)
-        histfeatures = nn.functional.normalize(histfeatures, dim=-1)
-        similarity = torch.matmul(histfeatures, mean_proxies.transpose(1, 2))
-        similarity_unbind = similarity.view(similarity.size(0), -1)
-        _, similarity_topk_idx = torch.topk(similarity_unbind, self.top_k, dim=1)
-        proxies_topk_idx = similarity_topk_idx % self.num_proxies
-        similarity_topk_idx = torch.div(similarity_topk_idx, self.num_proxies, rounding_mode='floor')
-        proxies_indice = torch.mode(proxies_topk_idx, dim =1).values
-        mu_true = mu_proxies[proxies_indice]
-        sigma_true = sigma_proxies[proxies_indice]
-        gather_index = similarity_topk_idx.unsqueeze(-1).expand(-1, -1, self.hidden_dim)
-        histfeatures_topk = torch.gather(histfeatures, 1, gather_index)
-        logits = torch.mean(self.decoder(sampled_proxies), dim = 1)
-        return mu_true, sigma_true,  mu_proxies, sigma_proxies, histfeatures_topk, logits
-    
+
+        negative_valid = torch.gather(
+            valid_tokens,
+            dim=1,
+            index=negative_token_idx,
+        )
+
+        safe_negative = negative_values.masked_fill(
+            ~negative_valid,
+            0.0,
+        )
+
+        negative_mean = (
+            safe_negative.sum(dim=(1, 2))
+            / negative_valid.sum(dim=(1, 2)).clamp_min(1)
+        )  # [B]
+
+        mu_true = mu_proxies[proxy_idx]
+        sigma_true = sigma_proxies[proxy_idx]
+
+        base_output = (
+            positive_mean,
+            negative_mean,
+            mu_true,
+            sigma_true,
+            mu_proxies,
+            sigma_proxies,
+            features_topk,
+            logits,
+        )
+
+        # ---------------------------------------------------------
+        # Top-k feature tương ứng với từng proxy sai
+        # ---------------------------------------------------------
+
+        num_negative_proxies = self.num_proxies - 1
+
+        # [B, K0, P-1] -> [B, (P-1)*K0]
+        negative_token_idx_flat = (
+            negative_token_idx
+            .permute(0, 2, 1)
+            .reshape(B, num_negative_proxies * K0)
+        )
+
+        # [B, N, H] -> lấy các feature theo index.
+        negative_features_flat = torch.gather(
+            features,
+            dim=1,
+            index=negative_token_idx_flat.unsqueeze(-1).expand(
+                -1,
+                -1,
+                self.hidden_dim,
+            ),
+        )
+
+        # [B, P-1, K0, H]
+        negative_selected_features = negative_features_flat.reshape(
+            B,
+            num_negative_proxies,
+            K0,
+            self.hidden_dim,
+        )
+
+        # [B, K0, P-1] -> [B, P-1, K0]
+        negative_selected_mask = negative_valid.permute(0, 2, 1)
+
+        # Lấy vector của từng proxy sai theo đúng thứ tự negative_indices.
+        # mean_proxies: [P, H]
+        # negative_indices: [B, P-1]
+        negative_proxy_vectors = mean_proxies[negative_indices]
+        # [B, P-1, H]
+
+        if not return_triplet:
+            return base_output
+
+        triplet_data = {
+            # Proxy đúng [B, H].
+            # Dù key tên "anchor" theo code cũ, từ nay nó là POSITIVE.
+            "anchor": mean_proxies[proxy_idx],
+
+            # Top-k feature theo proxy đúng.
+            "positives": features_topk,                 # [B, K, H]
+            "positive_mask": features_topk_mask,        # [B, K]
+
+            # Danh sách toàn bộ proxy.
+            "proxies": mean_proxies,                    # [P, H]
+            "positive_proxy_idx": proxy_idx,            # [B]
+
+            # Top-k feature theo từng proxy sai.
+            "negative_selected_features": negative_selected_features,
+            # [B, P-1, K0, H]
+
+            "negative_selected_mask": negative_selected_mask,
+            # [B, P-1, K0]
+
+            "negative_proxy_vectors": negative_proxy_vectors,
+            # [B, P-1, H]
+        }
+
+        return (*base_output, triplet_data)
+
+    def predict(self, x, mask=None):
+        """
+        Inference không dùng y/c.
+
+        Chọn proxy có điểm similarity lớn nhất sau khi xét
+        mọi token thật, rồi chọn top-k token theo proxy đó.
+
+        Giữ thứ tự 7 đầu ra như predict cũ.
+        """
+        features = self._encode(x)
+        padding_mask = self._padding_mask(x, mask)
+
+        B, N, H = features.shape
+
+        (
+            mu_proxies,
+            sigma_proxies,
+            _,
+            mean_proxies,
+            logits,
+        ) = self._sample_proxies(deterministic=True)
+
+        similarity = features @ mean_proxies.transpose(0, 1)
+
+        masked_similarity = similarity.masked_fill(
+            padding_mask.unsqueeze(-1),
+            float("-inf"),
+        )
+
+        # Với mỗi bệnh nhân, chọn cặp token–proxy có similarity
+        # cao nhất, lấy proxy của cặp đó làm proxy dự đoán.
+        flat_idx = masked_similarity.reshape(B, -1).argmax(dim=1)
+
+        predicted_proxy_idx = flat_idx % self.num_proxies
+
+        features_topk, _, _, _ = self._topk_by_proxy(
+            features=features,
+            similarity=similarity,
+            proxy_idx=predicted_proxy_idx,
+            padding_mask=padding_mask,
+        )
+
+        mu_true = mu_proxies[predicted_proxy_idx]
+        sigma_true = sigma_proxies[predicted_proxy_idx]
+
+        return (
+            mu_true,
+            sigma_true,
+            mu_proxies,
+            sigma_proxies,
+            features_topk,
+            logits,
+        )
+
 def masked_mean(
     values: torch.Tensor,
     mask: torch.Tensor,

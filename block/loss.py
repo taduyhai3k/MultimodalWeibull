@@ -392,6 +392,9 @@ class PIBDWeibullLoss(nn.Module):
         expectation_eps=1e-7,
         lambda_floor=0.01,
         lambda_penalty_weight=0.0,
+        positive_triplet_weight=1.0,
+        negative_triplet_weight=0.1,
+        triplet_margin=0.1
     ):
         super().__init__()
 
@@ -405,6 +408,9 @@ class PIBDWeibullLoss(nn.Module):
         self.kl_weight = kl_weight
         self.alignment_weight = alignment_weight
         self.mi_weight = mi_weight
+        self.positive_triplet_weight = positive_triplet_weight
+        self.negative_triplet_weight = negative_triplet_weight
+        self.triplet_margin = triplet_margin
 
         self.expectation_mse_weight = expectation_mse_weight
         self.expectation_eps = expectation_eps
@@ -582,14 +588,58 @@ class PIBDWeibullLoss(nn.Module):
         finally:
             for v, state in zip(params, states):
                 v.requires_grad_(state)
+
+        positive_triplet = x.new_zeros(())
+        negative_selected_triplet = x.new_zeros(())
+
+        if (
+            self.positive_triplet_weight > 0
+            or self.negative_selected_triplet_weight > 0
+        ):
+            for name in ("histology", "pathway"):
+                triplet_data = output[name]["triplet"]
+
+                # Tên key "anchor" là tên cũ trong dictionary.
+                # Thực tế đây là vector proxy đúng.
+                correct_proxy = triplet_data["anchor"]
+
+                if self.positive_triplet_weight > 0:
+                    loss_correct, n_correct = triplet_topk_correct_proxy(
+                        topk_features=triplet_data["positives"],
+                        feature_mask=triplet_data["positive_mask"],
+                        correct_proxy=correct_proxy,
+                        all_proxies=triplet_data["proxies"],
+                        correct_proxy_idx=triplet_data["positive_proxy_idx"],
+                        margin=self.triplet_margin,
+                    )
+
+                    positive_triplet = positive_triplet + loss_correct
+
+                if self.negative_selected_triplet_weight > 0:
+                    loss_wrong, n_wrong = triplet_topk_wrong_proxy(
+                        selected_features=(
+                            triplet_data["negative_selected_features"]
+                        ),
+                        selected_mask=(
+                            triplet_data["negative_selected_mask"]
+                        ),
+                        correct_proxy=correct_proxy,
+                        wrong_proxies=(
+                            triplet_data["negative_proxy_vectors"]
+                        ),
+                        margin=self.triplet_margin,
+                    )
+
+                    negative_selected_triplet = (
+                        negative_selected_triplet + loss_wrong
+                    )
         total_before_mse = (
             self.survival_weight * survival
             + self.proxy_weight * proxy
             + self.kl_weight * kl
             + self.alignment_weight * alignment
-            + self.mi_weight * mi + self.lambda_penalty_weight * self.lambda_regularization(output)
+            + self.mi_weight * mi + self.lambda_penalty_weight * self.lambda_regularization(output) + self.positive_triplet_weight * positive_triplet + self.negative_triplet_weight * negative_selected_triplet
         )
-
         if self.expectation_mse_weight > 0:
             mse = self.expectation_mse(
                 output=output,
@@ -614,4 +664,266 @@ class PIBDWeibullLoss(nn.Module):
             "mi": mi,
             "expectation_mse": mse,
             "expectation_mse_weighted": weighted_mse,
+            "positive_triplet": positive_triplet,
+            "negative_selected_triplet": negative_selected_triplet,
+            "positive_triplet_weighted": (
+                self.positive_triplet_weight * positive_triplet
+            ),
+            "negative_selected_triplet_weighted": (
+                self.negative_triplet_weight
+                * negative_selected_triplet
+            ),
         }
+
+
+
+
+import torch
+import torch.nn.functional as F
+
+
+def triplet_topk_correct_proxy(
+    topk_features,
+    feature_mask,
+    correct_proxy,
+    all_proxies,
+    correct_proxy_idx,
+    margin=0.2,
+):
+    """
+    Triplet từ top-k feature được chọn theo proxy đúng.
+
+    Anchor:
+        topk_features[b, k]
+
+    Positive:
+        correct_proxy[b]
+
+    Negative:
+        tất cả proxy p != correct_proxy_idx[b].
+
+    Parameters
+    ----------
+    topk_features:
+        [B, K, H]
+
+    feature_mask:
+        [B, K], True = feature thật, False = vị trí lặp/padding.
+
+    correct_proxy:
+        [B, H]
+
+    all_proxies:
+        [P, H]
+
+    correct_proxy_idx:
+        [B]
+
+    Returns
+    -------
+    loss:
+        Scalar tensor.
+
+    n_triplets:
+        Số triplet hợp lệ, kiểu Python int.
+    """
+
+    if margin < 0:
+        raise ValueError("margin phải >= 0.")
+
+    if topk_features.ndim != 3:
+        raise ValueError("topk_features phải có shape [B, K, H].")
+
+    B, K, H = topk_features.shape
+
+    if correct_proxy.shape != (B, H):
+        raise ValueError(
+            f"correct_proxy cần shape {(B, H)}, "
+            f"nhận được {tuple(correct_proxy.shape)}."
+        )
+
+    if all_proxies.ndim != 2 or all_proxies.size(1) != H:
+        raise ValueError("all_proxies phải có shape [P, H].")
+
+    P = all_proxies.size(0)
+
+    if P < 2:
+        raise ValueError("Cần ít nhất 2 proxy.")
+
+    feature_mask = feature_mask.to(
+        device=topk_features.device,
+        dtype=torch.bool,
+    )
+
+    if feature_mask.shape != (B, K):
+        raise ValueError(
+            f"feature_mask cần shape {(B, K)}."
+        )
+
+    correct_proxy_idx = correct_proxy_idx.reshape(-1).to(
+        device=topk_features.device,
+        dtype=torch.long,
+    )
+
+    if correct_proxy_idx.shape != (B,):
+        raise ValueError(
+            f"correct_proxy_idx cần shape {(B,)}."
+        )
+
+    if (
+        (correct_proxy_idx < 0).any()
+        or (correct_proxy_idx >= P).any()
+    ):
+        raise ValueError("correct_proxy_idx không hợp lệ.")
+
+    # Normalize để dùng cosine similarity.
+    features = F.normalize(topk_features.float(), dim=-1)
+    positive = F.normalize(correct_proxy.float(), dim=-1)
+    proxies = F.normalize(all_proxies.float(), dim=-1)
+
+    # sim(feature, proxy đúng): [B, K]
+    sim_positive = (
+        features * positive.unsqueeze(1)
+    ).sum(dim=-1)
+
+    # sim(feature, mọi proxy): [B, K, P]
+    sim_all = torch.matmul(
+        features,
+        proxies.transpose(0, 1),
+    )
+
+    proxy_ids = torch.arange(
+        P,
+        device=features.device,
+    ).view(1, 1, P)
+
+    # Loại proxy đúng khỏi tập negative.
+    negative_mask = (
+        proxy_ids != correct_proxy_idx.view(B, 1, 1)
+    )  # [B, 1, P]
+
+    valid_mask = (
+        feature_mask.unsqueeze(-1)
+        & negative_mask
+    )  # [B, K, P]
+
+    # Cosine distance = 1 - similarity.
+    #
+    # d(feature, positive) - d(feature, negative)
+    # = sim(feature, negative) - sim(feature, positive)
+    values = F.relu(
+        sim_all
+        - sim_positive.unsqueeze(-1)
+        + margin
+    )
+
+    n_triplets = int(valid_mask.sum().item())
+
+    if n_triplets == 0:
+        zero = (
+            features.sum() + positive.sum() + proxies.sum()
+        ) * 0.0
+        return zero, 0
+
+    return values[valid_mask].mean(), n_triplets
+
+
+def triplet_topk_wrong_proxy(
+    selected_features,
+    selected_mask,
+    correct_proxy,
+    wrong_proxies,
+    margin=0.2,
+):
+    """
+    Triplet từ top-k feature được chọn theo từng proxy sai.
+
+    Anchor:
+        selected_features[b, q, k]
+
+    Positive:
+        correct_proxy[b]
+
+    Negative:
+        wrong_proxies[b, q] — proxy sai đã chọn feature đó.
+
+    Parameters
+    ----------
+    selected_features:
+        [B, Q, K, H], Q = P - 1.
+
+    selected_mask:
+        [B, Q, K], True = feature thật.
+
+    correct_proxy:
+        [B, H]
+
+    wrong_proxies:
+        [B, Q, H]
+
+    Returns
+    -------
+    loss:
+        Scalar tensor.
+
+    n_triplets:
+        Số triplet hợp lệ, kiểu Python int.
+    """
+
+    if margin < 0:
+        raise ValueError("margin phải >= 0.")
+
+    if selected_features.ndim != 4:
+        raise ValueError(
+            "selected_features phải có shape [B, Q, K, H]."
+        )
+
+    B, Q, K, H = selected_features.shape
+
+    if correct_proxy.shape != (B, H):
+        raise ValueError(
+            f"correct_proxy cần shape {(B, H)}."
+        )
+
+    if wrong_proxies.shape != (B, Q, H):
+        raise ValueError(
+            f"wrong_proxies cần shape {(B, Q, H)}."
+        )
+
+    selected_mask = selected_mask.to(
+        device=selected_features.device,
+        dtype=torch.bool,
+    )
+
+    if selected_mask.shape != (B, Q, K):
+        raise ValueError(
+            f"selected_mask cần shape {(B, Q, K)}."
+        )
+
+    features = F.normalize(selected_features.float(), dim=-1)
+    positive = F.normalize(correct_proxy.float(), dim=-1)
+    negative = F.normalize(wrong_proxies.float(), dim=-1)
+
+    # [B, Q, K]
+    sim_positive = (
+        features * positive[:, None, None, :]
+    ).sum(dim=-1)
+
+    # [B, Q, K]
+    sim_negative = (
+        features * negative[:, :, None, :]
+    ).sum(dim=-1)
+
+    values = F.relu(
+        sim_negative - sim_positive + margin
+    )
+
+    n_triplets = int(selected_mask.sum().item())
+
+    if n_triplets == 0:
+        zero = (
+            features.sum() + positive.sum() + negative.sum()
+        ) * 0.0
+        return zero, 0
+
+    return values[selected_mask].mean(), n_triplets

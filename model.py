@@ -88,9 +88,9 @@ class MultiModelWeibull(nn.Module):
 
     @staticmethod
     def _aux(values):
-        pos, neg, mu, sigma, all_mu, all_sigma, tokens, logits = values
+        pos, neg, mu, sigma, all_mu, all_sigma, tokens, logits, triplet = values
         return dict(positive=pos, negative=neg, mu=mu, sigma=sigma,
-                    all_mu=all_mu, all_sigma=all_sigma, logits=logits)
+                    all_mu=all_mu, all_sigma=all_sigma, logits=logits, triplet=triplet)
 
     def forward(self, histology_input, pathway_input, bins, event_time=None,
                 censor=None, mask=None, return_aux=False):
