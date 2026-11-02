@@ -518,8 +518,8 @@ class ModalEncoder(nn.Module):
         # 1. Chọn top-k feature theo PROXY ĐÚNG.
         # ---------------------------------------------------------
         (
-            features_topk,
-            features_topk_mask,
+            _features_by_true_proxy,
+            _features_by_true_proxy_mask,
             positive_values,
             positive_valid,
         ) = self._topk_by_proxy(
@@ -529,7 +529,6 @@ class ModalEncoder(nn.Module):
             padding_mask=padding_mask,
         )
 
-        # Không nhân -inf với 0.
         safe_positive = positive_values.masked_fill(
             ~positive_valid,
             0.0,
@@ -538,7 +537,7 @@ class ModalEncoder(nn.Module):
         positive_mean = (
             safe_positive.sum(dim=1)
             / positive_valid.sum(dim=1).clamp_min(1)
-        )  # [B]
+        )
 
         # ---------------------------------------------------------
         # 2. Giữ cách tính negative mean theo từng proxy sai.
@@ -549,6 +548,18 @@ class ModalEncoder(nn.Module):
             self.num_proxies,
             device=x.device,
         ).unsqueeze(0).expand(B, -1)
+
+        (
+            features_topk,
+            features_topk_mask,
+            global_token_indices,
+            global_proxy_indices,
+            global_similarity_values,
+        ) = self._topk_across_proxies(
+            features=features,
+            similarity=similarity,
+            padding_mask=padding_mask,
+        )
 
         negative_indices = proxy_ids[
             proxy_ids != proxy_idx.unsqueeze(1)
@@ -656,44 +667,103 @@ class ModalEncoder(nn.Module):
             return base_output
 
         triplet_data = {
-            # Proxy đúng [B, H].
-            # Dù key tên "anchor" theo code cũ, từ nay nó là POSITIVE.
-            "anchor": mean_proxies[proxy_idx],
+            # Proxy đúng: positive trong triplet loss.
+            # Giữ tên "anchor" để tương thích với code loss hiện tại.
+            "anchor": mean_proxies[proxy_idx],  # [B, H]
 
-            # Top-k feature theo proxy đúng.
+            # Anchor thực sự của triplet:
+            # top-k feature được chọn trên toàn bộ proxy.
             "positives": features_topk,                 # [B, K, H]
-            "positive_mask": features_topk_mask,        # [B, K]
+            "positive_mask": features_topk_mask,         # [B, K]
 
-            # Danh sách toàn bộ proxy.
-            "proxies": mean_proxies,                    # [P, H]
-            "positive_proxy_idx": proxy_idx,            # [B]
+            # Toàn bộ proxy và index proxy đúng.
+            "proxies": mean_proxies,                     # [P, H]
+            "positive_proxy_idx": proxy_idx,             # [B]
 
-            # Top-k feature theo từng proxy sai.
-            "negative_selected_features": negative_selected_features,
-            # [B, P-1, K0, H]
+            # Giữ nguyên: top-k feature theo từng proxy sai.
+            "negative_selected_features": (
+                negative_selected_features
+            ),  # [B, P-1, K0, H]
 
-            "negative_selected_mask": negative_selected_mask,
-            # [B, P-1, K0]
+            "negative_selected_mask": (
+                negative_selected_mask
+            ),  # [B, P-1, K0]
 
-            "negative_proxy_vectors": negative_proxy_vectors,
-            # [B, P-1, H]
+            "negative_proxy_vectors": (
+                negative_proxy_vectors
+            ),  # [B, P-1, H]
+
+            # Thông tin top-k toàn bộ proxy.
+            "global_features_mask": features_topk_mask,
+            "global_token_indices": global_token_indices,
+            "global_proxy_indices": global_proxy_indices,
+            "global_similarity_values": global_similarity_values,
         }
 
         return (*base_output, triplet_data)
 
-    def predict(self, x, mask=None):
+    def predict(
+        self,
+        x,
+        mask=None,
+        return_details=False,
+    ):
         """
-        Inference không dùng y/c.
+        Inference không sử dụng y hoặc c.
 
-        Chọn proxy có điểm similarity lớn nhất sau khi xét
-        mọi token thật, rồi chọn top-k token theo proxy đó.
+        Cách chọn:
+            1. Chọn top-k cặp (feature, proxy) trên toàn bộ proxy.
+            2. Lấy mode của proxy index trong các cặp hợp lệ.
+            3. Dùng proxy mode làm proxy dự đoán.
 
-        Giữ thứ tự 7 đầu ra như predict cũ.
+        Parameters
+        ----------
+        x:
+            [B, N, input_dim]
+
+        mask:
+            [B, N], True = padding.
+
+        return_details:
+            False:
+                Trả 6 output như predict hiện tại.
+
+            True:
+                Trả thêm dictionary chứa thông tin top-k và
+                proxy dự đoán.
+
+        Returns
+        -------
+        mu_pred:
+            [B, H]
+
+        sigma_pred:
+            [B, H]
+
+        mu_proxies:
+            [P, H]
+
+        sigma_proxies:
+            [P, H]
+
+        features_topk:
+            [B, top_k, H]
+
+        logits:
+            [P, P]
+
+        details, nếu return_details=True:
+            Dictionary chứa index, mask và số phiếu proxy.
         """
+
         features = self._encode(x)
-        padding_mask = self._padding_mask(x, mask)
 
         B, N, H = features.shape
+
+        padding_mask = self._padding_mask(
+            x,
+            mask,
+        )
 
         (
             mu_proxies,
@@ -701,38 +771,254 @@ class ModalEncoder(nn.Module):
             _,
             mean_proxies,
             logits,
-        ) = self._sample_proxies(deterministic=True)
+        ) = self._sample_proxies(
+            deterministic=True,
+        )
 
+        # [B, N, H] @ [H, P] -> [B, N, P]
         similarity = features @ mean_proxies.transpose(0, 1)
 
+        (
+            features_topk,
+            features_topk_mask,
+            topk_token_indices,
+            topk_proxy_indices,
+            topk_similarity_values,
+        ) = self._topk_across_proxies(
+            features=features,
+            similarity=similarity,
+            padding_mask=padding_mask,
+        )
+
+        # ---------------------------------------------------------
+        # Mode proxy, chỉ tính các cặp hợp lệ.
+        # ---------------------------------------------------------
+        proxy_counts = torch.zeros(
+            B,
+            self.num_proxies,
+            dtype=torch.long,
+            device=features.device,
+        )
+
+        # Những vị trí padding/lặp do thiếu cặp có trọng số 0.
+        proxy_counts.scatter_add_(
+            dim=1,
+            index=topk_proxy_indices,
+            src=features_topk_mask.long(),
+        )
+
+        # Nếu hòa số phiếu, argmax chọn proxy có index nhỏ hơn.
+        predicted_proxy_idx = proxy_counts.argmax(dim=1)
+
+        mu_pred = mu_proxies[
+            predicted_proxy_idx
+        ]
+
+        sigma_pred = sigma_proxies[
+            predicted_proxy_idx
+        ]
+
+        base_output = (
+            mu_pred,
+            sigma_pred,
+            mu_proxies,
+            sigma_proxies,
+            features_topk,
+            logits,
+        )
+
+        if not return_details:
+            return base_output
+
+        details = {
+            "predicted_proxy_idx": predicted_proxy_idx,      # [B]
+            "proxy_counts": proxy_counts,                   # [B, P]
+            "topk_token_indices": topk_token_indices,       # [B, K]
+            "topk_proxy_indices": topk_proxy_indices,       # [B, K]
+            "topk_similarity_values": topk_similarity_values,  # [B, K]
+            "features_topk_mask": features_topk_mask,       # [B, K]
+        }
+
+        return (*base_output, details)
+    def _topk_across_proxies(
+        self,
+        features,
+        similarity,
+        padding_mask,
+    ):
+        """
+        Chọn top-k CẶP (feature, proxy) có similarity cao nhất.
+
+        Parameters
+        ----------
+        features:
+            [B, N, H]
+
+        similarity:
+            [B, N, P]
+
+        padding_mask:
+            [B, N]
+            True  = padding
+            False = token thật
+
+        Returns
+        -------
+        selected_features:
+            [B, top_k, H]
+
+        selected_mask:
+            [B, top_k]
+            True  = cặp hợp lệ
+            False = vị trí bổ sung do thiếu cặp hợp lệ
+
+        selected_token_idx:
+            [B, top_k]
+
+        selected_proxy_idx:
+            [B, top_k]
+
+        selected_values:
+            [B, top_k]
+
+        Lưu ý
+        -----
+        Một token có thể được chọn nhiều lần nếu nó nằm trong
+        nhiều cặp token–proxy có similarity cao.
+        """
+        B, N, H = features.shape
+        P = similarity.size(-1)
+
+        if similarity.shape != (B, N, self.num_proxies):
+            raise ValueError(
+                "similarity phải có shape "
+                f"{(B, N, self.num_proxies)}, "
+                f"nhận được {tuple(similarity.shape)}"
+            )
+
+        # Không cho các token padding tham gia lựa chọn.
         masked_similarity = similarity.masked_fill(
             padding_mask.unsqueeze(-1),
             float("-inf"),
         )
 
-        # Với mỗi bệnh nhân, chọn cặp token–proxy có similarity
-        # cao nhất, lấy proxy của cặp đó làm proxy dự đoán.
-        flat_idx = masked_similarity.reshape(B, -1).argmax(dim=1)
+        # [B, N, P] -> [B, N*P]
+        flat_similarity = masked_similarity.reshape(B, N * P)
 
-        predicted_proxy_idx = flat_idx % self.num_proxies
+        # Không thể lấy nhiều hơn N*P phần tử vật lý.
+        K0 = min(self.top_k, N * P)
 
-        features_topk, _, _, _ = self._topk_by_proxy(
-            features=features,
-            similarity=similarity,
-            proxy_idx=predicted_proxy_idx,
-            padding_mask=padding_mask,
+        top_values, flat_indices = torch.topk(
+            flat_similarity,
+            k=K0,
+            dim=1,
         )
 
-        mu_true = mu_proxies[predicted_proxy_idx]
-        sigma_true = sigma_proxies[predicted_proxy_idx]
+        # flat_index = token_index * P + proxy_index
+        token_indices = torch.div(
+            flat_indices,
+            P,
+            rounding_mode="floor",
+        )
+
+        proxy_indices = flat_indices % P
+
+        # Kiểm tra cặp được chọn có thuộc token thật không.
+        valid = torch.gather(
+            ~padding_mask,
+            dim=1,
+            index=token_indices,
+        )
+
+        # _padding_mask đã đảm bảo mỗi bệnh nhân có ít nhất
+        # một token thật, nên top-1 là cặp hợp lệ nếu
+        # similarity hữu hạn.
+        fallback_token = token_indices[:, :1].expand_as(token_indices)
+        fallback_proxy = proxy_indices[:, :1].expand_as(proxy_indices)
+
+        safe_token_indices = torch.where(
+            valid,
+            token_indices,
+            fallback_token,
+        )
+
+        safe_proxy_indices = torch.where(
+            valid,
+            proxy_indices,
+            fallback_proxy,
+        )
+
+        # Khi top_k > N*P, bổ sung các vị trí lặp.
+        # Các vị trí này được đánh dấu False trong selected_mask.
+        if self.top_k > K0:
+            extra_count = self.top_k - K0
+
+            extra_token_indices = token_indices[:, :1].expand(
+                B,
+                extra_count,
+            )
+
+            extra_proxy_indices = proxy_indices[:, :1].expand(
+                B,
+                extra_count,
+            )
+
+            safe_token_indices = torch.cat(
+                [safe_token_indices, extra_token_indices],
+                dim=1,
+            )
+
+            safe_proxy_indices = torch.cat(
+                [safe_proxy_indices, extra_proxy_indices],
+                dim=1,
+            )
+
+            extra_valid = torch.zeros(
+                B,
+                extra_count,
+                dtype=torch.bool,
+                device=features.device,
+            )
+
+            valid = torch.cat(
+                [valid, extra_valid],
+                dim=1,
+            )
+
+            extra_values = torch.zeros(
+                B,
+                extra_count,
+                dtype=top_values.dtype,
+                device=top_values.device,
+            )
+
+            top_values = torch.cat(
+                [top_values, extra_values],
+                dim=1,
+            )
+
+        # Không để -inf đi ra các phép tính tiếp theo.
+        selected_values = top_values.masked_fill(
+            ~valid,
+            0.0,
+        )
+
+        selected_features = torch.gather(
+            features,
+            dim=1,
+            index=safe_token_indices.unsqueeze(-1).expand(
+                -1,
+                -1,
+                H,
+            ),
+        )
 
         return (
-            mu_true,
-            sigma_true,
-            mu_proxies,
-            sigma_proxies,
-            features_topk,
-            logits,
+            selected_features,
+            valid,
+            safe_token_indices,
+            safe_proxy_indices,
+            selected_values,
         )
 
 def masked_mean(

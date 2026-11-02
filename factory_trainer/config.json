@@ -23,7 +23,7 @@
     "input_dim": 768,
     "hidden_dim": 128,
     "num_proxies": 8,
-    "top_k": 256,
+    "top_k": 1024,
     "sample_num": 30,
     "num_member": 16
   },
@@ -38,8 +38,8 @@
     "expectation_eps": 1e-7,
     "lambda_floor": 1e-4,
     "lambda_penalty_weight": 1e-3,
-    "positive_triplet_weight": 1,
-    "negative_triplet_weight": 0.1,
+    "positive_triplet_weight": 2,
+    "negative_triplet_weight": 0.2,
     "triplet_margin":0.1
   },
   "training": {
@@ -48,9 +48,9 @@
     "lr": 0.0001,
     "club_lr": 0.0001,
     "weight_decay": 0.0001,
-    "batch_size": 256,
-    "eval_batch_size": 256,
-    "workers": 0,
+    "batch_size": 128,
+    "eval_batch_size": 128,
+    "workers": 2,
     "seed": 42,
     "clip": 5.0,
     "plot_every": 5,

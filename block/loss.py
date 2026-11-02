@@ -594,7 +594,7 @@ class PIBDWeibullLoss(nn.Module):
 
         if (
             self.positive_triplet_weight > 0
-            or self.negative_selected_triplet_weight > 0
+            or self.negative_triplet_weight > 0
         ):
             for name in ("histology", "pathway"):
                 triplet_data = output[name]["triplet"]
@@ -615,7 +615,7 @@ class PIBDWeibullLoss(nn.Module):
 
                     positive_triplet = positive_triplet + loss_correct
 
-                if self.negative_selected_triplet_weight > 0:
+                if self.negative_triplet_weight > 0:
                     loss_wrong, n_wrong = triplet_topk_wrong_proxy(
                         selected_features=(
                             triplet_data["negative_selected_features"]
