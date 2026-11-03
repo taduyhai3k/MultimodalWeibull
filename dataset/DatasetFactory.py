@@ -240,7 +240,7 @@ class SurvivalDatasetFactory:
             norm_omics = self._apply_scaler(flat_omics, scaler)
             df_omics = pd.DataFrame(norm_omics.reshape(num_patients, num_features), columns=original_columns)
             df_omics["temp_index"] = case_ids_series.values
-            sample = True
+            sample = True if split_key == "train" else False
             
             dataset = DatasetSurvival.SurvivalDataset(split_key=split_key, fold= fold, study_name= self.study_name, omic_format= self.omic_format, patient_dict=self.slide_id_dict,
                                                       metadata= df_data, omic_data_dict= df_omics, data_dir= self.wsi_dir, num_classes= len(self.label_discrete_dict), 
