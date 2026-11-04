@@ -377,6 +377,332 @@ def get_KL_loss(
         f"nhưng nhận được {reduction!r}."
     )
 
+
+class PairwiseRankingLoss(nn.Module):
+    """
+    Pairwise logistic ranking loss cho survival analysis.
+
+    Quy ước
+    -------
+    censor = 0:
+        Event đã xảy ra.
+
+    censor = 1:
+        Right-censored.
+
+    risk lớn hơn:
+        Dự đoán rủi ro cao hơn / event có xu hướng sớm hơn.
+
+    Một cặp (i, j) được xem là so sánh được nếu:
+
+        1. i có event và time_i < time_j; hoặc
+        2. i có event, j bị censor và time_i == time_j,
+           nếu include_event_censor_ties=True.
+    """
+
+    def __init__(
+        self,
+        temperature: float = 1.0,
+        include_event_censor_ties: bool = True,
+    ):
+        super().__init__()
+
+        if temperature <= 0:
+            raise ValueError(
+                "temperature phải > 0."
+            )
+
+        self.temperature = float(temperature)
+
+        self.include_event_censor_ties = bool(
+            include_event_censor_ties
+        )
+
+    def forward(
+        self,
+        risk: torch.Tensor,
+        times: torch.Tensor,
+        censor: torch.Tensor,
+    ):
+        """
+        Parameters
+        ----------
+        risk:
+            [B] hoặc [B, 1], có gradient.
+
+        times:
+            [B] hoặc [B, 1].
+
+        censor:
+            [B] hoặc [B, 1].
+
+        Returns
+        -------
+        loss:
+            Scalar tensor.
+
+        num_pairs:
+            Số cặp so sánh được trong batch.
+        """
+
+        risk = risk.reshape(-1)
+        times = times.reshape(-1).to(
+            device=risk.device,
+        )
+        censor = censor.reshape(-1).to(
+            device=risk.device,
+        )
+
+        B = risk.numel()
+
+        if times.numel() != B or censor.numel() != B:
+            raise ValueError(
+                "risk, times và censor phải có cùng số phần tử."
+            )
+
+        if not torch.isfinite(risk).all():
+            raise ValueError(
+                "risk chứa NaN hoặc Inf."
+            )
+
+        if not torch.isfinite(times).all():
+            raise ValueError(
+                "times chứa NaN hoặc Inf."
+            )
+
+        if not ((censor == 0) | (censor == 1)).all():
+            raise ValueError(
+                "censor phải bằng 0 hoặc 1."
+            )
+
+        # Hàng i, cột j:
+        #
+        # time_i: [B, 1]
+        # time_j: [1, B]
+        time_i = times[:, None]
+        time_j = times[None, :]
+
+        censor_i = censor[:, None]
+        censor_j = censor[None, :]
+
+        # i có event trước thời gian quan sát của j.
+        comparable = (
+            (censor_i == 0)
+            & (time_i < time_j)
+        )
+
+        # Khớp quy tắc tie trong hàm c_index em đã đưa:
+        # i event và j censor tại cùng thời gian.
+        if self.include_event_censor_ties:
+            comparable = comparable | (
+                (censor_i == 0)
+                & (censor_j == 1)
+                & (time_i == time_j)
+            )
+
+        num_pairs = int(
+            comparable.sum().item()
+        )
+
+        if num_pairs == 0:
+            # Trả loss 0 nhưng vẫn nối với graph.
+            return risk.sum() * 0.0, 0
+
+        risk_i = risk[:, None]
+        risk_j = risk[None, :]
+
+        # Chênh lệch risk:
+        # Cặp đúng mong muốn: risk_i > risk_j.
+        raw_difference = risk_i - risk_j  # [B, B]
+
+        # Chỉ chọn cặp vừa so sánh được, vừa xếp sai.
+        #
+        # Nếu bằng nhau, hiện tại không xem là sai.
+        wrong_pairs = comparable & (
+            raw_difference < 0
+        )
+
+        num_comparable = comparable.sum()
+        num_wrong = wrong_pairs.sum()
+
+        # Loss cho từng cặp.
+        #
+        # temperature điều khiển độ nhạy theo thang đo risk.
+        # scale là hệ số điều chỉnh độ lớn loss/gradient.
+        pair_losses =F.softplus(
+            -raw_difference / self.temperature
+        )
+
+        # Mask bằng where, sau đó chia theo tổng số cặp so sánh được.
+        #
+        # Nếu batch không có cặp sai, kết quả bằng 0;
+        # tensor vẫn nối với computation graph.
+        loss = torch.where(
+            wrong_pairs,
+            pair_losses,
+            torch.zeros_like(pair_losses),
+        ).sum() / num_comparable.clamp_min(1)
+
+        return loss, num_pairs
+
+def weibull_mixture_rmst(
+    shapes: torch.Tensor,
+    rates: torch.Tensor,
+    weights: torch.Tensor,
+    horizon: float,
+    num_steps: int = 128,
+):
+    """
+    Tính RMST của Weibull mixture bằng tích phân số.
+
+    Parameters
+    ----------
+    shapes:
+        [B, M], tham số shape k > 0.
+
+    rates:
+        [B, M], tham số rate lambda > 0 theo:
+            S(t) = exp(-lambda * t**k)
+
+    weights:
+        [B, M], trọng số mixture không âm.
+
+    horizon:
+        Giới hạn tích phân, cùng đơn vị với thời gian.
+
+    num_steps:
+        Số điểm trên lưới tích phân, >= 2.
+
+    Returns
+    -------
+    rmst:
+        [B], có gradient đối với tham số đầu vào.
+    """
+
+    if horizon <= 0:
+        raise ValueError(
+            "horizon phải > 0."
+        )
+
+    if num_steps < 2:
+        raise ValueError(
+            "num_steps phải >= 2."
+        )
+
+    if (
+        shapes.ndim != 2
+        or rates.shape != shapes.shape
+        or weights.shape != shapes.shape
+    ):
+        raise ValueError(
+            "shapes, rates, weights phải cùng shape [B, M]."
+        )
+
+    if not (
+        torch.isfinite(shapes).all()
+        and torch.isfinite(rates).all()
+        and torch.isfinite(weights).all()
+    ):
+        raise ValueError(
+            "Tham số Weibull chứa NaN hoặc Inf."
+        )
+
+    if (shapes <= 0).any() or (rates <= 0).any():
+        raise ValueError(
+            "shapes và rates phải > 0."
+        )
+
+    if (weights < 0).any():
+        raise ValueError(
+            "weights phải không âm."
+        )
+
+    weight_sum = weights.sum(
+        dim=-1,
+        keepdim=True,
+    )
+
+    if (weight_sum <= 0).any():
+        raise ValueError(
+            "Mỗi bệnh nhân phải có tổng weights > 0."
+        )
+
+    weights = weights / weight_sum
+
+    # Dùng float64 cho phép tích phân và log/exponential
+    # để giảm nguy cơ tràn số so với float32.
+    #
+    # Việc chuyển dtype vẫn giữ gradient.
+    shapes64 = shapes.to(torch.float64)
+    rates64 = rates.to(torch.float64)
+    weights64 = weights.to(torch.float64)
+
+    # Điểm 0 được xử lý riêng:
+    # S(0) = 1 cho Weibull có shape > 0.
+    positive_times = torch.linspace(
+        0.0,
+        float(horizon),
+        num_steps,
+        device=shapes.device,
+        dtype=torch.float64,
+    )[1:]
+
+    # [B, M, T-1]
+    log_cumulative_hazard = (
+        torch.log(rates64).unsqueeze(-1)
+        + shapes64.unsqueeze(-1)
+        * torch.log(positive_times)[None, None, :]
+    )
+
+    # Chặn giá trị lớn để tránh exp overflow.
+    # Đây là xấp xỉ số: tại hazard rất lớn, S(t) gần 0.
+    cumulative_hazard = torch.exp(
+        log_cumulative_hazard.clamp(max=80.0)
+    )
+
+    component_survival = torch.exp(
+        -cumulative_hazard
+    )
+
+    # [B, T-1]
+    mixture_survival_positive = (
+        weights64.unsqueeze(-1)
+        * component_survival
+    ).sum(dim=1)
+
+    # Ghép S(0) = 1.
+    survival_at_zero = torch.ones(
+        shapes.size(0),
+        1,
+        device=shapes.device,
+        dtype=torch.float64,
+    )
+
+    survival = torch.cat(
+        [
+            survival_at_zero,
+            mixture_survival_positive,
+        ],
+        dim=1,
+    )  # [B, T]
+
+    times = torch.linspace(
+        0.0,
+        float(horizon),
+        num_steps,
+        device=shapes.device,
+        dtype=torch.float64,
+    )
+
+    # Tích phân hình thang theo trục thời gian.
+    rmst = torch.trapezoid(
+        survival,
+        x=times,
+        dim=1,
+    )
+
+    return rmst  # [B], dtype float64
+
 class PIBDWeibullLoss(nn.Module):
     """PIBD-inspired objective with Weibull NLL and optional expectation MSE."""
 
@@ -394,7 +720,8 @@ class PIBDWeibullLoss(nn.Module):
         lambda_penalty_weight=0.0,
         positive_triplet_weight=1.0,
         negative_triplet_weight=0.1,
-        triplet_margin=0.1
+        triplet_margin=0.1,
+        ranking_weight=0.1,
     ):
         super().__init__()
 
@@ -411,7 +738,7 @@ class PIBDWeibullLoss(nn.Module):
         self.positive_triplet_weight = positive_triplet_weight
         self.negative_triplet_weight = negative_triplet_weight
         self.triplet_margin = triplet_margin
-
+        self.ranking_weight = ranking_weight
         self.expectation_mse_weight = expectation_mse_weight
         self.expectation_eps = expectation_eps
 
@@ -426,6 +753,9 @@ class PIBDWeibullLoss(nn.Module):
 
         self.club_hp = CLUBStable(hidden_dim, hidden_dim)
         self.club_common = CLUBStable(2 * hidden_dim, hidden_dim)
+
+        self.ranking_loss = PairwiseRankingLoss(temperature=1.0)
+
 
     def club_parameters(self):
         return list(self.club_hp.parameters()) + list(self.club_common.parameters())
@@ -633,12 +963,28 @@ class PIBDWeibullLoss(nn.Module):
                     negative_selected_triplet = (
                         negative_selected_triplet + loss_wrong
                     )
+        rmst = weibull_mixture_rmst(
+            shapes=output["shapes"].float(),
+            rates=output["scales"].float(),
+            weights=output["weights"].float(),
+            horizon=20,
+            num_steps=128,
+        )
+
+        risk = -rmst
+
+        ranking_loss, num_pairs = self.ranking_loss(
+            risk=risk,
+            times=event_time,
+            censor=censor,
+        )
         total_before_mse = (
             self.survival_weight * survival
             + self.proxy_weight * proxy
             + self.kl_weight * kl
             + self.alignment_weight * alignment
             + self.mi_weight * mi + self.lambda_penalty_weight * self.lambda_regularization(output) + self.positive_triplet_weight * positive_triplet + self.negative_triplet_weight * negative_selected_triplet
+            + self.ranking_weight * ranking_loss
         )
         if self.expectation_mse_weight > 0:
             mse = self.expectation_mse(
@@ -662,6 +1008,7 @@ class PIBDWeibullLoss(nn.Module):
             "kl": kl,
             "alignment": alignment,
             "mi": mi,
+            "ranking_loss": ranking_loss,
             "expectation_mse": mse,
             "expectation_mse_weighted": weighted_mse,
             "positive_triplet": positive_triplet,
