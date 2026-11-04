@@ -217,7 +217,109 @@ class WeibullLossandInference(nn.Module):
             f"nhưng nhận được: {reduction}"
         )
             
+def weibull_actual_parameters(
+    output,
+    eps=1e-7,
+):
+    """
+    Chuyển hệ số Weibull của model thành tham số thực tế.
 
+    output["x"]:
+        [B, D]
+
+    output["shapes"]:
+        [B, M, D] — hệ số shape.
+
+    output["scales"]:
+        [B, M, D] — hệ số rate lambda.
+
+    output["weights"]:
+        [B, M]
+
+    Returns
+    -------
+    shapes:
+        [B, M], shape k > 0.
+
+    rates:
+        [B, M], rate lambda > 0.
+
+    weights:
+        [B, M], tổng theo M bằng 1.
+    """
+
+    x = output["x"].float()
+    shape_coeffs = output["shapes"].float()
+    rate_coeffs = output["scales"].float()
+    weights = output["weights"].float()
+
+    if x.ndim != 2:
+        raise ValueError(
+            f'output["x"] phải là [B, D], '
+            f'nhận được {tuple(x.shape)}'
+        )
+
+    if shape_coeffs.ndim != 3:
+        raise ValueError(
+            f'output["shapes"] phải là [B, M, D], '
+            f'nhận được {tuple(shape_coeffs.shape)}'
+        )
+
+    if rate_coeffs.shape != shape_coeffs.shape:
+        raise ValueError(
+            'output["scales"] phải cùng shape với '
+            'output["shapes"]'
+        )
+
+    B, M, D = shape_coeffs.shape
+
+    if x.shape != (B, D):
+        raise ValueError(
+            f'output["x"] phải là {(B, D)}, '
+            f'nhận được {tuple(x.shape)}'
+        )
+
+    if weights.shape != (B, M):
+        raise ValueError(
+            f'output["weights"] phải là {(B, M)}, '
+            f'nhận được {tuple(weights.shape)}'
+        )
+
+    # [B, D] và [B, M, D] -> [B, M]
+    shape_logits = torch.einsum(
+        "bd,bmd->bm",
+        x,
+        shape_coeffs,
+    )
+
+    rate_logits = torch.einsum(
+        "bd,bmd->bm",
+        x,
+        rate_coeffs,
+    )
+
+    shapes = f.softplus(shape_logits) + eps
+    rates = f.softplus(rate_logits) + eps
+
+    if not torch.isfinite(weights).all():
+        raise ValueError("weights chứa NaN hoặc Inf")
+
+    if (weights < 0).any():
+        raise ValueError("weights phải không âm")
+
+    weight_sum = weights.sum(
+        dim=-1,
+        keepdim=True,
+    )
+
+    if (weight_sum <= 0).any():
+        raise ValueError(
+            "Mỗi bệnh nhân phải có tổng weights > 0"
+        )
+
+    weights = weights
+
+    return shapes, rates, weights
 def nll_survival_loss(
     logits,
     y,
@@ -963,10 +1065,15 @@ class PIBDWeibullLoss(nn.Module):
                     negative_selected_triplet = (
                         negative_selected_triplet + loss_wrong
                     )
+        shapes, rates, weights = weibull_actual_parameters(
+            output,
+            eps=1e-7,
+        )
+
         rmst = weibull_mixture_rmst(
-            shapes=output["shapes"].float(),
-            rates=output["scales"].float(),
-            weights=output["weights"].float(),
+            shapes=shapes,
+            rates=rates,
+            weights=weights,
             horizon=20,
             num_steps=128,
         )

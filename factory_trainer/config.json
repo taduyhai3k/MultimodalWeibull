@@ -51,7 +51,7 @@
     "weight_decay": 0.0001,
     "batch_size": 64,
     "eval_batch_size": 1,
-    "workers": 2,
+    "workers": 0,
     "seed": 42,
     "clip": 5.0,
     "plot_every": 5,
