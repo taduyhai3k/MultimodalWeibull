@@ -153,7 +153,12 @@ for cohort in "${cohort_list[@]}"; do
     for fold in "${fold_list[@]}"; do
         fold_dir="$OUTPUT_DIR/$cohort/fold_$fold"
         marker="$STATE_DIR/${cohort}_fold_${fold}.done"
-        if [[ -f "$marker" && -f "$fold_dir/best.pt" && -f "$fold_dir/val_best_metrics.json" ]]; then
+        if [[ -f "$marker" && -s "$fold_dir/best.pt" && -s "$fold_dir/val_best_metrics.json" ]]; then
+            if [[ -f "$fold_dir/last.pt" ]]; then
+                rm -- "$fold_dir/last.pt"
+                say "Removed leftover checkpoint: $fold_dir/last.pt"
+            fi
+
             say "Already completed: $cohort fold $fold; skip"
             continue
         fi
@@ -171,9 +176,35 @@ for cohort in "${cohort_list[@]}"; do
         "$PYTHON_BIN" -m factory_trainer.run --config "$runtime_config" --root "$PROJECT_ROOT" \
           --output "$OUTPUT_DIR" --cohorts "$cohort" --folds "$fold" "${resume_args[@]}" 9>&- &
         train_pid=$!
-        wait "$train_pid"
-        train_pid=""
+        if wait "$train_pid"; then
+            train_pid=""
+        else
+            status=$?
+            train_pid=""
+
+            echo "ERROR: Train thất bại: $cohort fold $fold; exit=$status" >&2
+            echo "Giữ last.pt để có thể resume." >&2
+
+            exit "$status"
+        fi
+
+        if [[ ! -s "$fold_dir/best.pt" ]]; then
+            echo "ERROR: Thiếu hoặc rỗng best.pt: $fold_dir" >&2
+            exit 1
+        fi
+
+        if [[ ! -s "$fold_dir/val_best_metrics.json" ]]; then
+            echo "ERROR: Thiếu hoặc rỗng val_best_metrics.json: $fold_dir" >&2
+            exit 1
+        fi
+
         date -Is >"$marker"
+
+        if [[ -f "$fold_dir/last.pt" ]]; then
+            rm -- "$fold_dir/last.pt"
+            say "Removed completed checkpoint: $fold_dir/last.pt"
+        fi
+
         say "Completed $cohort fold $fold"
     done
 done

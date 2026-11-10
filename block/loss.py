@@ -142,7 +142,7 @@ class WeibullLossandInference(nn.Module):
         scales = scales.clamp_min(self.eps)
         weights = weights.clamp_min(self.eps)
 
-        # Chuẩn hóa lại để tổng trọng số bằng 1
+        #Chuẩn hóa lại để tổng trọng số bằng 1
         weights = weights / weights.sum(
             dim=-1,
             keepdim=True
@@ -480,9 +480,14 @@ def get_KL_loss(
     )
 
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
 class PairwiseRankingLoss(nn.Module):
     """
-    Pairwise logistic ranking loss cho survival analysis.
+    Pairwise ranking loss cho survival analysis.
 
     Quy ước
     -------
@@ -493,19 +498,41 @@ class PairwiseRankingLoss(nn.Module):
         Right-censored.
 
     risk lớn hơn:
-        Dự đoán rủi ro cao hơn / event có xu hướng sớm hơn.
+        Dự báo event có xu hướng xảy ra sớm hơn.
 
-    Một cặp (i, j) được xem là so sánh được nếu:
+    Nếu risk = -RMST:
+        risk_i > risk_j
+        tương đương RMST_i < RMST_j.
 
+    Cặp (i, j) so sánh được khi:
         1. i có event và time_i < time_j; hoặc
         2. i có event, j bị censor và time_i == time_j,
            nếu include_event_censor_ties=True.
+
+    Loss xét tất cả cặp so sánh được.
+
+    Trọng số:
+        time_weight_strength > 0:
+            Cặp có khoảng cách thời gian lớn hơn có trọng số lớn hơn.
+
+    Margin:
+        margin_ratio = 0:
+            Không yêu cầu margin thay đổi theo thời gian.
+
+        margin_ratio > 0:
+            Khuyến khích chênh lệch risk lớn hơn khi
+            khoảng cách thời gian quan sát lớn hơn.
     """
 
     def __init__(
         self,
         temperature: float = 1.0,
         include_event_censor_ties: bool = True,
+        time_scale: float = 1.0,
+        time_weight_strength: float = 1.0,
+        max_normalized_time_gap: float = 10.0,
+        margin_ratio: float = 0.1,
+        max_margin_time_gap: float | None = None,
     ):
         super().__init__()
 
@@ -514,10 +541,56 @@ class PairwiseRankingLoss(nn.Module):
                 "temperature phải > 0."
             )
 
+        if time_scale <= 0:
+            raise ValueError(
+                "time_scale phải > 0."
+            )
+
+        if time_weight_strength < 0:
+            raise ValueError(
+                "time_weight_strength phải >= 0."
+            )
+
+        if max_normalized_time_gap <= 0:
+            raise ValueError(
+                "max_normalized_time_gap phải > 0."
+            )
+
+        if margin_ratio < 0:
+            raise ValueError(
+                "margin_ratio phải >= 0."
+            )
+
+        if (
+            max_margin_time_gap is not None
+            and max_margin_time_gap <= 0
+        ):
+            raise ValueError(
+                "max_margin_time_gap phải > 0 hoặc None."
+            )
+
         self.temperature = float(temperature)
 
         self.include_event_censor_ties = bool(
             include_event_censor_ties
+        )
+
+        self.time_scale = float(time_scale)
+
+        self.time_weight_strength = float(
+            time_weight_strength
+        )
+
+        self.max_normalized_time_gap = float(
+            max_normalized_time_gap
+        )
+
+        self.margin_ratio = float(margin_ratio)
+
+        self.max_margin_time_gap = (
+            None
+            if max_margin_time_gap is None
+            else float(max_margin_time_gap)
         )
 
     def forward(
@@ -530,13 +603,16 @@ class PairwiseRankingLoss(nn.Module):
         Parameters
         ----------
         risk:
-            [B] hoặc [B, 1], có gradient.
+            [B] hoặc [B, 1].
+            Phải còn nằm trên computation graph.
 
         times:
             [B] hoặc [B, 1].
+            Thời gian event/censor.
 
         censor:
             [B] hoặc [B, 1].
+            0 = event, 1 = censored.
 
         Returns
         -------
@@ -544,13 +620,35 @@ class PairwiseRankingLoss(nn.Module):
             Scalar tensor.
 
         num_pairs:
-            Số cặp so sánh được trong batch.
+            Số cặp so sánh được.
+
+        Lưu ý
+        -----
+        Interface trả về giống hàm cũ:
+            loss, num_pairs = criterion(...)
         """
 
         risk = risk.reshape(-1)
+
+        if not torch.is_floating_point(risk):
+            raise TypeError(
+                "risk phải là floating-point tensor."
+            )
+
+        # Khi dùng AMP hoặc float16, chuyển các phép tính loss
+        # về ít nhất float32 để hạn chế vấn đề số học.
+        #
+        # .float() vẫn giữ gradient về risk ban đầu.
+        if risk.dtype in (
+            torch.float16,
+            torch.bfloat16,
+        ):
+            risk = risk.float()
+
         times = times.reshape(-1).to(
             device=risk.device,
         )
+
         censor = censor.reshape(-1).to(
             device=risk.device,
         )
@@ -572,29 +670,40 @@ class PairwiseRankingLoss(nn.Module):
                 "times chứa NaN hoặc Inf."
             )
 
-        if not ((censor == 0) | (censor == 1)).all():
+        if (times < 0).any():
+            raise ValueError(
+                "times không được âm."
+            )
+
+        if not (
+            (censor == 0)
+            | (censor == 1)
+        ).all():
             raise ValueError(
                 "censor phải bằng 0 hoặc 1."
             )
 
-        # Hàng i, cột j:
+        # Dùng dtype của risk cho phép tính khoảng cách.
+        # Chuyển dtype vẫn giữ được gradient của risk.
         #
-        # time_i: [B, 1]
-        # time_j: [1, B]
+        # Nếu time có độ chính xác rất cao, quy tắc so sánh
+        # thời gian nên được xác nhận theo dữ liệu gốc.
         time_i = times[:, None]
         time_j = times[None, :]
 
         censor_i = censor[:, None]
         censor_j = censor[None, :]
 
-        # i có event trước thời gian quan sát của j.
+        # ---------------------------------------------------------
+        # 1. Xác định cặp so sánh được.
+        # ---------------------------------------------------------
         comparable = (
             (censor_i == 0)
             & (time_i < time_j)
         )
 
-        # Khớp quy tắc tie trong hàm c_index em đã đưa:
-        # i event và j censor tại cùng thời gian.
+        # Đúng theo quy tắc tie trong hàm c_index em từng gửi:
+        # i có event và j bị censor tại cùng thời gian.
         if self.include_event_censor_ties:
             comparable = comparable | (
                 (censor_i == 0)
@@ -607,46 +716,69 @@ class PairwiseRankingLoss(nn.Module):
         )
 
         if num_pairs == 0:
-            # Trả loss 0 nhưng vẫn nối với graph.
+            # Loss bằng 0 nhưng vẫn gắn với graph.
             return risk.sum() * 0.0, 0
 
-        risk_i = risk[:, None]
-        risk_j = risk[None, :]
+        # ---------------------------------------------------------
+        # 2. Chỉ lấy những cặp hợp lệ.
+        # ---------------------------------------------------------
+        risk_difference = (
+            risk[:, None] - risk[None, :]
+        )[comparable]
 
-        # Chênh lệch risk:
-        # Cặp đúng mong muốn: risk_i > risk_j.
-        raw_difference = risk_i - risk_j  # [B, B]
+        # Với cặp hợp lệ, time_j >= time_i.
+        time_gap = (
+            time_j - time_i
+        )[comparable].to(dtype=risk.dtype)
 
-        # Chỉ chọn cặp vừa so sánh được, vừa xếp sai.
-        #
-        # Nếu bằng nhau, hiện tại không xem là sai.
-        wrong_pairs = comparable & (
-            raw_difference < 0
+        # ---------------------------------------------------------
+        # 3. Trọng số tăng theo khoảng cách thời gian.
+        # ---------------------------------------------------------
+        normalized_gap = (
+            time_gap / self.time_scale
+        ).clamp(
+            max=self.max_normalized_time_gap,
         )
 
-        num_comparable = comparable.sum()
-        num_wrong = wrong_pairs.sum()
-
-        # Loss cho từng cặp.
-        #
-        # temperature điều khiển độ nhạy theo thang đo risk.
-        # scale là hệ số điều chỉnh độ lớn loss/gradient.
-        pair_losses =F.softplus(
-            -raw_difference / self.temperature
+        pair_weights = (
+            1.0
+            + self.time_weight_strength * normalized_gap
         )
 
-        # Mask bằng where, sau đó chia theo tổng số cặp so sánh được.
+        # ---------------------------------------------------------
+        # 4. Margin phụ thuộc khoảng cách thời gian.
+        # ---------------------------------------------------------
+        margin_gap = time_gap
+
+        if self.max_margin_time_gap is not None:
+            margin_gap = margin_gap.clamp(
+                max=self.max_margin_time_gap,
+            )
+
+        margin = self.margin_ratio * margin_gap
+
+        # Muốn:
         #
-        # Nếu batch không có cặp sai, kết quả bằng 0;
-        # tensor vẫn nối với computation graph.
-        loss = torch.where(
-            wrong_pairs,
-            pair_losses,
-            torch.zeros_like(pair_losses),
-        ).sum() / num_comparable.clamp_min(1)
+        # risk_i - risk_j >= margin
+        #
+        # Nếu risk = -RMST:
+        #
+        # RMST_j - RMST_i >= margin
+        #
+        # Đây là mục tiêu mềm: không phải ràng buộc cứng.
+        pair_losses = F.softplus(
+            (margin - risk_difference)
+            / self.temperature
+        )
+
+        # ---------------------------------------------------------
+        # 5. Weighted mean trên các cặp hợp lệ.
+        # ---------------------------------------------------------
+        loss = (
+            pair_weights * pair_losses
+        ).sum() / pair_weights.sum()
 
         return loss, num_pairs
-
 def weibull_mixture_rmst(
     shapes: torch.Tensor,
     rates: torch.Tensor,
