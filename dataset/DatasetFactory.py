@@ -83,7 +83,7 @@ class SurvivalDatasetFactory:
         # Read the label data from the file
         label_data = pd.read_csv(self.label_file, low_memory=False)
         label_data[self.label_col] = (
-        pd.to_numeric(label_data[self.label_col], errors="raise") / 12.0
+        pd.to_numeric(label_data[self.label_col], errors="raise")
         )
         if "IDC" in label_data['oncotree_code']:  # must be BRCA (and if so, use only IDCs)
             label_data = label_data[label_data['oncotree_code'] == 'IDC']

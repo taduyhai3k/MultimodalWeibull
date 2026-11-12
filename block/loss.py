@@ -216,6 +216,212 @@ class WeibullLossandInference(nn.Module):
             f"reduction phải là 'mean', 'sum' hoặc 'none', "
             f"nhưng nhận được: {reduction}"
         )
+    
+class EventSurvivalLoss(nn.Module):
+    """
+    Loss kéo survival tại thời điểm event về gần 0.
+
+    Loss:
+        mean(S_mix(t_i)^2) trên các bệnh nhân có event.
+
+    Weibull mixture:
+        S_mix(t) = sum_m pi_m * exp(-lambda_m * t^k_m)
+
+    Quy ước censor:
+        0 = event
+        1 = right-censored
+    """
+
+    def forward(
+        self,
+        shapes: torch.Tensor,
+        rates: torch.Tensor,
+        weights: torch.Tensor,
+        times: torch.Tensor,
+        censor: torch.Tensor,
+    ):
+        """
+        Parameters
+        ----------
+        shapes:
+            [B, M], shape k > 0.
+
+        rates:
+            [B, M], rate lambda > 0 trong công thức
+            S(t) = exp(-lambda * t**k).
+
+        weights:
+            [B, M], trọng số mixture không âm.
+
+        times:
+            [B] hoặc [B, 1], thời gian event/censor >= 0.
+
+        censor:
+            [B] hoặc [B, 1], 0 = event, 1 = censored.
+
+        Returns
+        -------
+        loss:
+            Scalar tensor.
+
+        num_events:
+            Số bệnh nhân có event trong batch.
+        """
+
+        if shapes.ndim != 2:
+            raise ValueError(
+                "shapes phải có shape [B, M], "
+                f"nhận được {tuple(shapes.shape)}."
+            )
+
+        if rates.shape != shapes.shape:
+            raise ValueError(
+                "rates phải cùng shape với shapes."
+            )
+
+        if weights.shape != shapes.shape:
+            raise ValueError(
+                "weights phải cùng shape với shapes."
+            )
+
+        B, M = shapes.shape
+
+        if B == 0 or M == 0:
+            raise ValueError(
+                "Batch và số thành phần mixture phải > 0."
+            )
+
+        # Đưa thời gian và censor về cùng device.
+        times = times.reshape(-1).to(
+            device=shapes.device,
+        )
+
+        censor = censor.reshape(-1).to(
+            device=shapes.device,
+        )
+
+        if times.numel() != B or censor.numel() != B:
+            raise ValueError(
+                "times và censor phải có đúng B phần tử."
+            )
+
+        if not (
+            shapes.device == rates.device == weights.device
+        ):
+            raise ValueError(
+                "shapes, rates và weights phải cùng device."
+            )
+
+        if not (
+            torch.isfinite(shapes).all()
+            and torch.isfinite(rates).all()
+            and torch.isfinite(weights).all()
+            and torch.isfinite(times).all()
+        ):
+            raise ValueError(
+                "Đầu vào chứa NaN hoặc Inf."
+            )
+
+        if (shapes <= 0).any() or (rates <= 0).any():
+            raise ValueError(
+                "shapes và rates phải > 0."
+            )
+
+        if (weights < 0).any():
+            raise ValueError(
+                "weights phải không âm."
+            )
+
+        if (times < 0).any():
+            raise ValueError(
+                "times không được âm."
+            )
+
+        if not ((censor == 0) | (censor == 1)).all():
+            raise ValueError(
+                "censor phải bằng 0 hoặc 1."
+            )
+
+        # Chỉ bệnh nhân đã xảy ra event.
+        event_mask = censor == 0
+
+        num_events = int(
+            event_mask.sum().item()
+        )
+
+        if num_events == 0:
+            # Giữ loss = 0 và vẫn kết nối với computation graph.
+            zero = (
+                shapes.sum()
+                + rates.sum()
+                + weights.sum()
+            ) * 0.0
+
+            return zero, 0
+
+        # Tính bằng float64 để giảm nguy cơ tràn số;
+        # chuyển dtype vẫn giữ gradient về model.
+        event_shapes = shapes[event_mask].to(torch.float64)
+        event_rates = rates[event_mask].to(torch.float64)
+        event_weights = weights[event_mask].to(torch.float64)
+        event_times = times[event_mask].to(torch.float64)
+
+        weight_sum = event_weights.sum(
+            dim=-1,
+            keepdim=True,
+        )
+
+        if (weight_sum <= 0).any():
+            raise ValueError(
+                "Mỗi bệnh nhân có event phải có tổng weights > 0."
+            )
+
+        event_weights = event_weights / weight_sum
+
+        # Xử lý t = 0 riêng: S(0) = 1.
+        #
+        # Không tính log(0). Đối với các giá trị t > 0,
+        # log(t) được dùng để tính cumulative hazard.
+        positive_time = event_times > 0
+
+        safe_times = torch.where(
+            positive_time,
+            event_times,
+            torch.ones_like(event_times),
+        )
+
+        log_cumulative_hazard = (
+            torch.log(event_rates)
+            + event_shapes * torch.log(
+                safe_times[:, None]
+            )
+        )
+
+        # Khi log hazard rất lớn, S(t) đã xấp xỉ 0.
+        # Chặn để tránh exp bị tràn.
+        cumulative_hazard = torch.exp(
+            log_cumulative_hazard.clamp(max=80.0)
+        )
+
+        survival_components = torch.exp(
+            -cumulative_hazard
+        )
+
+        # Nếu t = 0, survival của từng thành phần bằng 1.
+        survival_components = torch.where(
+            positive_time[:, None],
+            survival_components,
+            torch.ones_like(survival_components),
+        )
+
+        # S_mix(t) = sum_m pi_m * S_m(t).
+        survival_mix = (
+            event_weights * survival_components
+        ).sum(dim=-1)
+
+        loss = survival_mix.square().mean()
+
+        return loss, num_events   
             
 def weibull_actual_parameters(
     output,
@@ -955,7 +1161,8 @@ class PIBDWeibullLoss(nn.Module):
         positive_triplet_weight=1.0,
         negative_triplet_weight=0.1,
         triplet_margin=0.1,
-        ranking_weight=0.1,
+        ranking_weight=0,
+        event_survival_weight = 0.1
     ):
         super().__init__()
 
@@ -989,6 +1196,9 @@ class PIBDWeibullLoss(nn.Module):
         self.club_common = CLUBStable(2 * hidden_dim, hidden_dim)
 
         self.ranking_loss = PairwiseRankingLoss(temperature=1.0)
+
+        self.event_survival_weight = event_survival_weight
+        self.event_survival_loss = EventSurvivalLoss()
 
 
     def club_parameters(self):
@@ -1201,13 +1411,14 @@ class PIBDWeibullLoss(nn.Module):
             output,
             eps=1e-7,
         )
+        event_survival_loss = self.event_survival_loss(shapes, rates, weights,event_time, censor )
 
         rmst = weibull_mixture_rmst(
             shapes=shapes,
             rates=rates,
             weights=weights,
-            horizon=20,
-            num_steps=128,
+            horizon= 120,
+            num_steps=256,
         )
 
         risk = -rmst
@@ -1223,7 +1434,7 @@ class PIBDWeibullLoss(nn.Module):
             + self.kl_weight * kl
             + self.alignment_weight * alignment
             + self.mi_weight * mi + self.lambda_penalty_weight * self.lambda_regularization(output) + self.positive_triplet_weight * positive_triplet + self.negative_triplet_weight * negative_selected_triplet
-            + self.ranking_weight * ranking_loss
+            + self.ranking_weight * ranking_loss + self.event_survival_weight * event_survival_loss
         )
         if self.expectation_mse_weight > 0:
             mse = self.expectation_mse(
@@ -1259,6 +1470,7 @@ class PIBDWeibullLoss(nn.Module):
                 self.negative_triplet_weight
                 * negative_selected_triplet
             ),
+            "event_survival_loss": event_survival_loss
         }
 
 
