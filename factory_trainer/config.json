@@ -23,7 +23,7 @@
     "input_dim": 768,
     "hidden_dim": 128,
     "num_proxies": 8,
-    "top_k": 256,
+    "top_k": 2048,
     "sample_num": 50,
     "num_member": 16
   },
@@ -33,7 +33,7 @@
     "proxy_weight": 1.0,
     "kl_weight": 0.1,
     "alignment_weight": 1,
-    "mi_weight": 0.5,
+    "mi_weight": 1,
     "expectation_mse_weight": 0,
     "expectation_eps": 1e-7,
     "lambda_floor": 1e-4,
@@ -42,11 +42,11 @@
     "negative_triplet_weight": 0,
     "triplet_margin":0.3,
     "ranking_weight": 0,
-    "event_survival_weight": 1
+    "event_survival_weight": 0
   },
   "training": {
-    "epochs": 50,
-    "patience": 15,
+    "epochs": 200,
+    "patience": 75,
     "lr": 0.0001,
     "club_lr": 0.0001,
     "weight_decay": 0.0001,

@@ -57,9 +57,25 @@ class CLUBStable(nn.Module):
     
 
 class WeibullLossandInference(nn.Module):
-    def __init__(self, eps: float = 1e-7):
-        super(WeibullLossandInference, self).__init__()
-        self.eps = eps
+    def __init__(
+        self,
+        eps: float = 1e-7,
+        event_weight: float = 1.0,
+        censor_weight: float = 1.0,
+    ):
+        super().__init__()
+
+        if eps <= 0:
+            raise ValueError("eps phải > 0.")
+
+        if event_weight <= 0 or censor_weight <= 0:
+            raise ValueError(
+                "event_weight và censor_weight phải > 0."
+            )
+
+        self.eps = float(eps)
+        self.event_weight = float(event_weight)
+        self.censor_weight = float(censor_weight)
 
 
     def forward(self,x: torch.Tensor,
@@ -201,19 +217,80 @@ class WeibullLossandInference(nn.Module):
             log_pdf_mixture
         )
 
-        negative_log_likelihood = -log_likelihood
+        negative_log_likelihood = -log_likelihood  # [B]
+
+
+        if not (
+            (uncensored == 0) | (uncensored == 1)
+        ).all():
+            raise ValueError(
+                "uncensored phải bằng 0 hoặc 1."
+            )
+
+        event_mask = uncensored == 1
+        censor_mask = uncensored == 0
+
+        num_events = event_mask.sum()
+        num_censored = censor_mask.sum()
+
+        B = negative_log_likelihood.numel()
+
+        if B == 0:
+            raise ValueError("Batch không được rỗng.")
+
+        dtype = negative_log_likelihood.dtype
+
+        # Tổng trọng số của các nhóm thực sự có trong batch.
+        #
+        # Hai nhóm cùng có:
+        #     normalizer = event_weight + censor_weight
+        #
+        # Chỉ có một nhóm:
+        #     normalizer = weight của nhóm đó
+        normalizer = (
+            self.event_weight * (num_events > 0).to(dtype)
+            + self.censor_weight * (num_censored > 0).to(dtype)
+        )
+
+        # Hệ số cho từng bệnh nhân.
+        #
+        # Tổng hệ số của cả nhóm event:
+        #     event_weight / normalizer
+        #
+        # Tổng hệ số của cả nhóm censor:
+        #     censor_weight / normalizer
+        sample_weights = torch.where(
+            event_mask,
+            self.event_weight
+            / num_events.clamp_min(1).to(dtype),
+            self.censor_weight
+            / num_censored.clamp_min(1).to(dtype),
+        ) / normalizer
+
+        weighted_losses = (
+            sample_weights * negative_log_likelihood
+        )
+
+        # Giữ quan hệ:
+        #     reduction="none" -> tensor [B]
+        #     reduction="mean" -> trung bình tensor trên
+        #     reduction="sum"  -> tổng tensor trên
+        #
+        # Với reduction="mean", kết quả chính là tổng có trọng số
+        # của mean NLL hai nhóm.
+        per_patient_balanced_losses = B * weighted_losses
 
         if reduction == "mean":
-            return negative_log_likelihood.mean()
+            return per_patient_balanced_losses.mean()
 
         if reduction == "sum":
-            return negative_log_likelihood.sum()
+            return per_patient_balanced_losses.sum()
 
         if reduction == "none":
-            return negative_log_likelihood
+            return per_patient_balanced_losses
 
         raise ValueError(
-            f"reduction phải là 'mean', 'sum' hoặc 'none', "
+            "reduction phải là 'mean', 'sum' hoặc 'none', "
             f"nhưng nhận được: {reduction}"
         )
     
