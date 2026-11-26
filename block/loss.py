@@ -811,7 +811,7 @@ class PairwiseRankingLoss(nn.Module):
         self,
         temperature: float = 1.0,
         include_event_censor_ties: bool = True,
-        time_scale: float = 1.0,
+        time_scale: float = 10,
         time_weight_strength: float = 1.0,
         max_normalized_time_gap: float = 10.0,
         margin_ratio: float = 0.1,
@@ -1488,14 +1488,14 @@ class PIBDWeibullLoss(nn.Module):
             output,
             eps=1e-7,
         )
-        event_survival_loss = self.event_survival_loss(shapes, rates, weights,event_time, censor )
+        event_survival_loss, _ = self.event_survival_loss(shapes, rates, weights,event_time, censor )
 
         rmst = weibull_mixture_rmst(
             shapes=shapes,
             rates=rates,
             weights=weights,
-            horizon= 120,
-            num_steps=256,
+            horizon= 200,
+            num_steps=512,
         )
 
         risk = -rmst
