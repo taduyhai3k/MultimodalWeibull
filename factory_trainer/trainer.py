@@ -413,7 +413,7 @@ class Trainer:
                 improved = score > self.best + min_delta
                 if improved:self.best=score;self.bad=0
                 else:self.bad+=1
-                self.scheduler.step(score)
+                #self.scheduler.step(score)
                 phi=self.model.PoE.phi.detach().float().reshape(-1)
                 record=dict(epoch=number,step=self.step,seconds=time.time()-begin,lr=self.opt.param_groups[0]['lr'],
                     train_loss=train_loss,train_eval=train_eval,val=val,poe_phi=phi.cpu().tolist(),poe_alpha=phi.softmax(0).cpu().tolist())
